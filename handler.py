@@ -54,7 +54,12 @@ import torch
 import runpod
 
 MODEL_DIR = os.environ.get("QWEN_MODEL_DIR", "/models/qwen3-tts-1.7b-base")
-USE_COMPILE = os.environ.get("QWEN_COMPILE", "1") == "1"
+# Off by default. torch.compile cost two build cycles here — CUDA graphs are
+# outright incompatible with how this model carries state, and plain inductor
+# compilation is worth far less than a pipeline that reliably works. Flip the
+# endpoint's QWEN_COMPILE env var to "1" to measure it; that is a config change
+# on RunPod, not an image rebuild, so it costs a redeploy rather than 15 minutes.
+USE_COMPILE = os.environ.get("QWEN_COMPILE", "0") == "1"
 
 CODEC_HZ = 12
 CHARS_PER_SECOND_FLOOR = 7.0

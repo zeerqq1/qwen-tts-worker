@@ -29,7 +29,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # counts on — the same setting the local studio uses.
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     QWEN_MODEL_DIR=/models/qwen3-tts-1.7b-base \
-    QWEN_COMPILE=1
+    QWEN_COMPILE=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 ffmpeg git && \
