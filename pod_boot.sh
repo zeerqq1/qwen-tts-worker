@@ -1,32 +1,115 @@
 #!/usr/bin/env bash
 # Bring a freshly rented Pod up to serving state.
 #
-# Runs on a stock PyTorch image rather than a custom one: the Serverless build
-# lives in RunPod's internal registry, and relying on a Pod being able to pull
-# from there is an assumption this setup does not need to make. Everything here
-# comes from public sources.
-set -euo pipefail
+# Boot used to be a chain: apt-get, then git clone, then pip install, then a
+# 4.2GB model download, then load. Five and a half minutes of it, and each link
+# was both minutes of billing on every pod in the batch and its own chance to
+# fail — roughly one pod in five never reached serving at all.
+#
+# So: nothing waits for anything it does not actually need. The model download
+# and the Python packages come down at the same time, apt is gone from the
+# critical path entirely (git is replaced by a stdlib tarball fetch, and
+# libsndfile ships inside the soundfile wheel), and every network step retries
+# instead of killing the pod on one bad response.
+#
+# The pod runs the same engine.py as Serverless, so the audio is identical.
+set -uo pipefail
 
-REPO="${POD_REPO:-https://github.com/zeerqq1/qwen-tts-worker}"
+REPO_TAR="${POD_REPO_TAR:-https://codeload.github.com/zeerqq1/qwen-tts-worker/tar.gz/refs/heads/main}"
 DIR=/workspace/worker
+MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen3-TTS-12Hz-1.7B-Base}"
+MODEL_DIR="${QWEN_MODEL_DIR:-/workspace/qwen3-tts-1.7b-base}"
+export QWEN_MODEL_DIR
+PIP="python -m pip install -q --no-cache-dir --break-system-packages"
 
-echo "[boot] системные пакеты"
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends git libsndfile1 ffmpeg curl
+log() { echo "[boot] $*" >&2; }
 
-echo "[boot] код из $REPO"
-rm -rf "$DIR"
-git clone -q --depth 1 "$REPO" "$DIR"
-cd "$DIR"
+# Retry the things that touch the network. A single transient failure used to
+# cost the whole pod; three tries cost seconds.
+retry() {
+    local n=0
+    until "$@"; do
+        n=$((n + 1))
+        if [ "$n" -ge 3 ]; then
+            log "ПРОВАЛ после 3 попыток: $*"
+            return 1
+        fi
+        log "попытка $n не удалась, повтор: $*"
+        sleep 3
+    done
+    return 0
+}
 
-echo "[boot] python-зависимости"
-# --extra-index-url matters: if anything re-resolves torch, pip must pick the
-# CUDA wheel. A CPU build would run many times slower with no visible error.
-python -m pip install -q --break-system-packages \
-    --extra-index-url https://download.pytorch.org/whl/cu128 \
-    -r requirements-pod.txt
-python -c "import torch; assert torch.version.cuda, 'torch потерял CUDA'; \
-print('[boot] torch', torch.__version__, 'cuda', torch.version.cuda)"
+# ── 1. Code. urllib instead of git, so apt is not on the critical path. ──
+fetch_code() {
+    python - "$REPO_TAR" "$DIR" <<'PY'
+import io, os, shutil, sys, tarfile, urllib.request
+url, dest = sys.argv[1], sys.argv[2]
+blob = urllib.request.urlopen(url, timeout=90).read()
+tmp = dest + ".new"
+shutil.rmtree(tmp, ignore_errors=True)
+os.makedirs(tmp, exist_ok=True)
+with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+    tar.extractall(tmp)
+inner = os.path.join(tmp, os.listdir(tmp)[0])
+shutil.rmtree(dest, ignore_errors=True)
+shutil.move(inner, dest)
+shutil.rmtree(tmp, ignore_errors=True)
+print("[boot] код: " + ", ".join(sorted(os.listdir(dest))[:8]), file=sys.stderr)
+PY
+}
+retry fetch_code || exit 1
+cd "$DIR" || exit 1
 
-echo "[boot] запуск сервера"
+# ── 2. Weights, in the background. The single biggest item, so it starts first
+#       and everything else happens while it downloads. hf_transfer opens
+#       several connections instead of one. ──
+log "ставлю загрузчик"
+retry $PIP huggingface_hub hf_transfer || exit 1
+
+export HF_HUB_ENABLE_HF_TRANSFER=1
+log "тяну веса $MODEL_ID -> $MODEL_DIR (фоном)"
+(
+    for attempt in 1 2 3; do
+        python - "$MODEL_ID" "$MODEL_DIR" <<'PY' && exit 0
+import sys
+from huggingface_hub import snapshot_download
+snapshot_download(sys.argv[1], local_dir=sys.argv[2], max_workers=8)
+PY
+        echo "[boot] веса: попытка $attempt не удалась" >&2
+        sleep 5
+    done
+    exit 1
+) &
+MODEL_PID=$!
+
+# ── 3. Python packages, at the same time as the download above. torch and
+#       torchaudio come from the base image and are deliberately not listed:
+#       if pip re-resolves torch it can put a CPU build over the CUDA one and
+#       the pod then runs many times slower with nothing to notice. ──
+log "python-зависимости"
+retry $PIP --extra-index-url https://download.pytorch.org/whl/cu128 \
+    -r requirements-pod.txt || { kill $MODEL_PID 2>/dev/null; exit 1; }
+
+python - <<'PY' || exit 1
+import torch
+assert torch.version.cuda, "torch потерял CUDA — под работал бы на процессоре"
+print("[boot] torch", torch.__version__, "cuda", torch.version.cuda)
+PY
+
+# soundfile normally carries libsndfile inside its wheel; apt is only touched
+# on the rare image where it does not, and only then.
+if ! python -c "import soundfile" 2>/dev/null; then
+    log "soundfile без библиотеки — доставляю libsndfile1 через apt"
+    apt-get update -qq && apt-get install -y -qq --no-install-recommends libsndfile1
+fi
+
+# ── 4. Both halves have to be there before the model can load. ──
+log "жду веса"
+if ! wait $MODEL_PID; then
+    log "ПРОВАЛ: веса не скачались"
+    exit 1
+fi
+log "всё на месте, поднимаю сервер"
+
 exec python -u pod_server.py
