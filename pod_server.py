@@ -103,6 +103,12 @@ def health():
         "ok": True,
         "model_loaded": engine._model is not None,
         "gpu": engine.gpu_name(),
+        # Which torch actually ended up installed. On a base image whose torch
+        # is older than the TTS stack wants, pip may replace it during boot —
+        # a CPU build would be a 30x slowdown with no error, and even a CUDA
+        # build costs minutes of download. This makes either visible.
+        "torch": engine.torch.__version__,
+        "cuda": engine.torch.version.cuda,
         "compiled": engine.is_compiled(),
         "uptime_sec": round(time.time() - _started),
         "idle_sec": round(idle),
