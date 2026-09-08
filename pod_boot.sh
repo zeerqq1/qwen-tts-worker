@@ -21,7 +21,10 @@ set -uo pipefail
 # that never explained itself — and roughly one in five did not come up.
 mkdir -p /workspace
 exec > >(tee -a /workspace/boot.log) 2>&1
-cd /workspace && python -m http.server "${POD_PORT:-8000}" --bind 0.0.0.0 >/dev/null 2>&1 &
+# Started directly, not inside "cd && ..." — that would background a
+# subshell, $! would name the subshell, and killing it later would leave
+# the python child holding the port the real server needs.
+python -m http.server "${POD_PORT:-8000}" --bind 0.0.0.0 --directory /workspace >/dev/null 2>&1 &
 STATUS_PID=$!
 echo "[boot] $(date -u +%H:%M:%S) старт · $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || echo 'nvidia-smi недоступен')"
 
@@ -135,6 +138,12 @@ fi
 mark weights_done
 log "всё на месте, поднимаю сервер"
 
-# Hand the port over to the real server.
+# Hand the port over to the real server, and make sure it is actually free:
+# a port still held by the placeholder would keep this pod "not ready"
+# forever while billing.
 kill "$STATUS_PID" 2>/dev/null; wait "$STATUS_PID" 2>/dev/null
+for i in 1 2 3 4 5; do
+    python -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1]))) else 1)" "${POD_PORT:-8000}" || break
+    log "порт ещё занят раздатчиком, жду"; sleep 1
+done
 exec python -u pod_server.py
