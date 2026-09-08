@@ -143,7 +143,9 @@ log "всё на месте, поднимаю сервер"
 # forever while billing.
 kill "$STATUS_PID" 2>/dev/null; wait "$STATUS_PID" 2>/dev/null
 for i in 1 2 3 4 5; do
-    python -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1]))) else 1)" "${POD_PORT:-8000}" || break
+    # connect_ex is 0 when something still answers on the port. Exit 0 then
+    # (keep waiting); exit 1 once nothing answers, which is what breaks.
+    python -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1]))) == 0 else 1)" "${POD_PORT:-8000}" || break
     log "порт ещё занят раздатчиком, жду"; sleep 1
 done
 exec python -u pod_server.py
