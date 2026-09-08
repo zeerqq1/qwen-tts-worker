@@ -15,6 +15,16 @@
 # The pod runs the same engine.py as Serverless, so the audio is identical.
 set -uo pipefail
 
+# Everything this script prints goes to a file, and that file is served on the
+# pod's port until the real server takes over. RunPod exposes no container
+# logs through its API, so before this a pod that never came up was a pod
+# that never explained itself — and roughly one in five did not come up.
+mkdir -p /workspace
+exec > >(tee -a /workspace/boot.log) 2>&1
+cd /workspace && python -m http.server "${POD_PORT:-8000}" --bind 0.0.0.0 >/dev/null 2>&1 &
+STATUS_PID=$!
+echo "[boot] $(date -u +%H:%M:%S) старт · $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || echo 'nvidia-smi недоступен')"
+
 REPO_TAR="${POD_REPO_TAR:-https://codeload.github.com/zeerqq1/qwen-tts-worker/tar.gz/refs/heads/main}"
 DIR=/workspace/worker
 MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen3-TTS-12Hz-1.7B-Base}"
@@ -125,4 +135,6 @@ fi
 mark weights_done
 log "всё на месте, поднимаю сервер"
 
+# Hand the port over to the real server.
+kill "$STATUS_PID" 2>/dev/null; wait "$STATUS_PID" 2>/dev/null
 exec python -u pod_server.py
