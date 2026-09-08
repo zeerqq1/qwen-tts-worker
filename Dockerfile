@@ -7,11 +7,15 @@
 #
 # Base image is the official PyTorch build pinned to the SAME torch version the
 # studio runs locally (2.11.0 + cu128), so the cloud behaves like the machine
-# this was tested on. The -devel variant carries the full CUDA toolkit, which
-# torch.compile needs to generate kernels — that compile step is where most of
-# the cloud speedup comes from, so it is not worth risking a smaller image.
+# this was tested on.
+#
+# -runtime, not -devel: the devel variant is 14.1GB compressed against 4.3GB
+# for runtime, which with the 4.2GB of weights on top overflows the worker's
+# container disk and triples the cold-start pull. The full CUDA toolkit is not
+# needed — torch.compile drives Triton, which carries its own compiler — and
+# handler.py falls back to eager if compilation ever does fail.
 
-FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
+FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
