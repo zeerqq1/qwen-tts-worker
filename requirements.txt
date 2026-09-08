@@ -1,0 +1,9 @@
+# Worker dependencies. torch/torchaudio come from the base image — do not
+# reinstall them here or pip will pull a CPU build over the CUDA one.
+runpod>=1.7.0
+qwen-tts
+transformers==4.57.3
+accelerate
+soundfile
+numpy
+huggingface_hub
