@@ -24,6 +24,14 @@ PIP="python -m pip install -q --no-cache-dir --break-system-packages"
 
 log() { echo "[boot] $*" >&2; }
 
+# Where the minutes actually go. Written as epoch seconds and served by
+# /health, so boot can be measured instead of guessed at — including the
+# image pull, which happens before this script exists and is only visible
+# as the gap between renting the pod and the first mark here.
+MARKS=/workspace/boot_times.txt
+mark() { mkdir -p /workspace; echo "$1 $(date +%s)" >> "$MARKS"; }
+mark script_start
+
 # Retry the things that touch the network. A single transient failure used to
 # cost the whole pod; three tries cost seconds.
 retry() {
@@ -59,6 +67,7 @@ print("[boot] код: " + ", ".join(sorted(os.listdir(dest))[:8]), file=sys.stde
 PY
 }
 retry fetch_code || exit 1
+mark code_done
 cd "$DIR" || exit 1
 
 # ── 2. Weights, in the background. The single biggest item, so it starts first
@@ -66,6 +75,7 @@ cd "$DIR" || exit 1
 #       several connections instead of one. ──
 log "ставлю загрузчик"
 retry $PIP huggingface_hub hf_transfer || exit 1
+mark pip_hf_done
 
 export HF_HUB_ENABLE_HF_TRANSFER=1
 log "тяну веса $MODEL_ID -> $MODEL_DIR (фоном)"
@@ -82,6 +92,7 @@ PY
     exit 1
 ) &
 MODEL_PID=$!
+mark download_started
 
 # ── 3. Python packages, at the same time as the download above. torch and
 #       torchaudio come from the base image and are deliberately not listed:
@@ -105,11 +116,13 @@ if ! python -c "import soundfile" 2>/dev/null; then
 fi
 
 # ── 4. Both halves have to be there before the model can load. ──
+mark pip_done
 log "жду веса"
 if ! wait $MODEL_PID; then
     log "ПРОВАЛ: веса не скачались"
     exit 1
 fi
+mark weights_done
 log "всё на месте, поднимаю сервер"
 
 exec python -u pod_server.py

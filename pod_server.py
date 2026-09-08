@@ -35,6 +35,7 @@ MAX_LIFE_SEC = float(os.environ.get("POD_MAX_LIFE_SEC", "14400"))   # 4 hours
 
 app = Flask(__name__)
 _started = time.time()
+_model_ready_at = 0.0
 _last_seen = time.time()
 _lock = threading.Lock()
 # The model is not thread-safe: two generations running at once corrupt each
@@ -73,12 +74,32 @@ def _watchdog():
             os._exit(0)
 
 
+def _boot_marks() -> dict:
+    """Timing marks pod_boot.sh left behind, as epoch seconds.
+
+    The studio subtracts them from the moment it rented the pod, which is the
+    only way to see the image pull — that happens before any of our code runs
+    and is otherwise invisible.
+    """
+    out = {}
+    try:
+        for line in open("/workspace/boot_times.txt", encoding="utf-8"):
+            name, _, ts = line.strip().partition(" ")
+            if name and ts:
+                out[name] = float(ts)
+    except Exception:
+        pass
+    return out
+
+
 @app.get("/health")
 def health():
     _touch()
     with _lock:
         idle = time.time() - _last_seen
     return jsonify({
+        "boot": _boot_marks(),
+        "serving_since": _model_ready_at,
         "ok": True,
         "model_loaded": engine._model is not None,
         "gpu": engine.gpu_name(),
@@ -121,6 +142,7 @@ if __name__ == "__main__":
     print("[pod] загружаю модель...", flush=True)
     try:
         engine.load_model()
+        _model_ready_at = time.time()
         print(f"[pod] готов на {engine.gpu_name()}", flush=True)
     except Exception as e:
         print(f"[pod] модель не загрузилась: {engine.describe(e)}", flush=True)
