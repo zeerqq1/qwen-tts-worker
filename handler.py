@@ -16,10 +16,11 @@ Design goals, in order:
      reference's hash, so a burst of jobs hitting the same worker pays for it
      once.
 
-  3. Linux means torch.compile actually works. CUDA graphs collapse the
-     hundreds of tiny kernel launches per decoding step into one replay, which
-     is where most of the speedup on small autoregressive models comes from.
-     It is disabled automatically if compilation fails.
+  3. Linux means torch.compile actually works, and inductor's kernel fusion is
+     free speed on every decoding step. CUDA graphs are deliberately NOT used:
+     Qwen3-TTS carries hidden_states between steps, which a graph would
+     overwrite. If compilation misbehaves anyway the worker drops back to eager
+     mid-job rather than failing the request.
 
 Request:
     {"input": {
@@ -68,11 +69,32 @@ DEFAULT_SAMPLING = {
 _model = None
 _model_lock = threading.Lock()
 _compiled = False
+_eager_forward = None          # kept so a bad compile can be undone at runtime
 _prompt_cache: dict[str, object] = {}
 _prompt_lock = threading.Lock()
 
 
 # ─────────────────────── Model ───────────────────────
+def _disable_compile():
+    """Undo compilation for the rest of this worker's life.
+
+    A compile failure must never cost a job: better to finish the work a little
+    slower in eager mode than to return an error the caller has to retry.
+    """
+    global _compiled
+    if not _compiled or _eager_forward is None or _model is None:
+        return False
+    try:
+        _model.model.talker.forward = _eager_forward
+        _compiled = False
+        torch.cuda.empty_cache()
+        print("[worker] compile disabled, falling back to eager", flush=True)
+        return True
+    except Exception as e:
+        print(f"[worker] could not disable compile: {e}", flush=True)
+        return False
+
+
 def _load_model():
     global _model, _compiled
     with _model_lock:
@@ -96,11 +118,22 @@ def _load_model():
 
         if USE_COMPILE:
             # The talker is a standard HF module with its own generate(); its
-            # per-step forward is the hot path worth capturing.
+            # per-step forward is the hot path worth compiling.
+            #
+            # NOT mode="reduce-overhead": that turns on CUDA graphs, which
+            # require the model to stop referencing tensors from an earlier
+            # run. Qwen3-TTS carries hidden_states forward between decoding
+            # steps (past_hidden=hidden_states[:, -1:, :]), so the graph
+            # overwrites a tensor the model still reads and generation dies
+            # with "accessing tensor output of CUDAGraphs that has been
+            # overwritten". Plain inductor compilation keeps the kernel fusion
+            # without that constraint.
             try:
                 talker = model.model.talker
+                global _eager_forward
+                _eager_forward = talker.forward
                 talker.forward = torch.compile(
-                    talker.forward, mode="reduce-overhead", fullgraph=False, dynamic=True)
+                    talker.forward, fullgraph=False, dynamic=True)
                 _compiled = True
                 print("[worker] torch.compile enabled on talker.forward", flush=True)
             except Exception as e:
