@@ -240,6 +240,16 @@ def generate(payload: dict) -> dict:
     wavs, sr = [], 24000
     t0 = time.time()
     i, step = 0, safe_batch(texts, len(texts))
+    # Reported back so a throughput drop can be diagnosed from the client side
+    # instead of guessed at: if the batch silently shrinks between jobs, the
+    # model re-reads its weights more times per second of audio and everything
+    # slows down, which looks identical to the GPU being slower.
+    first_step = step
+    steps_used = []
+    try:
+        _free0 = torch.cuda.mem_get_info(0)[0] / 1e9
+    except Exception:
+        _free0 = -1.0
     while i < len(texts):
         part = texts[i:i + step]
         try:
@@ -247,6 +257,7 @@ def generate(payload: dict) -> dict:
                 text=part, language=[language] * len(part),
                 voice_clone_prompt=prompt, **kw)
             wavs.extend(w)
+            steps_used.append(len(part))
             i += step
         except Exception as e:
             msg = f"{e} {type(e).__name__} {traceback.format_exc()}".lower()
@@ -273,4 +284,9 @@ def generate(payload: dict) -> dict:
         "gen_sec": round(gen_sec, 2), "audio_sec": round(audio_sec, 2),
         "realtime_x": round(audio_sec / max(gen_sec, 0.01), 2),
         "compiled": _compiled, "gpu": gpu_name(),
+        "batch_first": first_step,
+        "batch_sizes": steps_used,
+        "free_gb_before": round(_free0, 1),
+        "free_gb_after": round(torch.cuda.mem_get_info(0)[0] / 1e9, 1)
+                         if torch.cuda.is_available() else -1,
     }
