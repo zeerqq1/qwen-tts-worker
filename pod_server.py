@@ -37,6 +37,13 @@ app = Flask(__name__)
 _started = time.time()
 _last_seen = time.time()
 _lock = threading.Lock()
+# The model is not thread-safe: two generations running at once corrupt each
+# other's tensors ("size of tensor a (16) must match ..."). Flask serves
+# requests concurrently and the studio can hand a pod a second job while the
+# first is still running, so generation has to be serialised here. Queuing is
+# the right behaviour anyway — the GPU can only do one batch at a time, and a
+# queued request costs nothing next to a failed one.
+_gpu_lock = threading.Lock()
 
 
 def _touch():
@@ -86,7 +93,9 @@ def generate():
     if not _authorised():
         return jsonify({"error": "bad token"}), 401
     _touch()
-    out = engine.generate(request.get_json(silent=True) or {})
+    with _gpu_lock:
+        _touch()  # waiting for the lock still counts as being talked to
+        out = engine.generate(request.get_json(silent=True) or {})
     _touch()      # generation can take minutes; do not let the watchdog fire
     if out.get("error"):
         return jsonify(out), 500
