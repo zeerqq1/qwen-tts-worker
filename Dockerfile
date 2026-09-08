@@ -52,6 +52,6 @@ from huggingface_hub import snapshot_download; \
 p = snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-Base', local_dir='/models/qwen3-tts-1.7b-base'); \
 print('model at', p)"
 
-COPY handler.py /app/handler.py
+COPY engine.py handler.py /app/
 
 CMD ["python", "-u", "/app/handler.py"]

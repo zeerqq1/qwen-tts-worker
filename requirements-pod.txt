@@ -1,0 +1,10 @@
+# Pod dependencies. torch/torchaudio come from the base image and are NOT
+# listed: if pip re-resolves torch it can install a CPU build over the CUDA
+# one, and the pod then runs many times slower with no error to notice.
+flask>=3.0
+qwen-tts
+transformers==4.57.3
+accelerate
+soundfile
+numpy
+huggingface_hub

@@ -1,10 +1,5 @@
-# Worker dependencies.
-#
-# torch/torchaudio come from the base image. They are NOT listed here on
-# purpose: if pip re-resolves torch it can install a CPU build over the CUDA
-# one, and the worker then runs many times slower with no error to notice.
-# The Dockerfile passes the cu128 index as a safety net and asserts CUDA
-# survived the install.
+# Serverless worker dependencies. Same note about torch as requirements-pod.txt:
+# it comes from the base image and must not be re-resolved by pip.
 runpod>=1.7.0
 qwen-tts
 transformers==4.57.3
