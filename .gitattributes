@@ -1,0 +1,5 @@
+# RunPod собирает образ на Linux: CRLF в Dockerfile ломает переносы строк
+* text=auto eol=lf
+Dockerfile text eol=lf
+*.py text eol=lf
+*.txt text eol=lf
