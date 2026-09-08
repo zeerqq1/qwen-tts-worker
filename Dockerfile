@@ -16,6 +16,11 @@ FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
+    # The base image ships a PEP 668 "externally managed" Python, so pip
+    # refuses to install system-wide without this. There is no OS package
+    # manager to defer to inside a single-purpose container, and a venv would
+    # only hide the interpreter that already carries the CUDA torch build.
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     # Keeps allocator fragmentation from eating the headroom the batch sizer
     # counts on — the same setting the local studio uses.
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -32,7 +37,7 @@ COPY requirements.txt /app/requirements.txt
 # --extra-index-url matters: if any dependency re-resolves torch, pip must pick
 # the CUDA wheel. Without it a CPU build can silently replace the GPU one and
 # the worker runs at a fraction of the speed with no visible error.
-RUN pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir \
         --extra-index-url https://download.pytorch.org/whl/cu128 \
         -r /app/requirements.txt && \
     python -c "import torch; assert torch.version.cuda, 'torch lost CUDA support'; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
