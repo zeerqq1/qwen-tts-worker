@@ -46,6 +46,7 @@ import io
 import os
 import time
 import threading
+import traceback
 
 import numpy as np
 import soundfile as sf
@@ -230,6 +231,20 @@ def _safe_batch(texts, requested):
 
 
 # ─────────────────────── Handler ───────────────────────
+def _describe(e: BaseException) -> str:
+    """A message that is actually usable from the client side.
+
+    str(e) is empty for a surprising number of torch/dynamo exceptions, which
+    turns a failed job into 'генерация: ' and leaves nothing to act on. The
+    type name and the last frames of the traceback always say something.
+    """
+    text = (str(e) or "").strip()
+    tb = traceback.format_exc()
+    print(tb, flush=True)                      # full trace lands in RunPod logs
+    tail = " | ".join(l.strip() for l in tb.strip().splitlines()[-4:])
+    return f"{type(e).__name__}: {text or '(без сообщения)'} | {tail}"[:900]
+
+
 def handler(job):
     inp = job.get("input") or {}
     texts = inp.get("texts") or []
@@ -241,7 +256,7 @@ def handler(job):
         prompt = _get_prompt(model, inp.get("ref_id", ""),
                              inp.get("ref_audio_b64", ""), inp.get("ref_text", ""))
     except Exception as e:
-        return {"error": f"подготовка голоса: {e}"}
+        return {"error": f"подготовка голоса: {_describe(e)}"}
 
     language = inp.get("language") or "Auto"
     sampling = {**DEFAULT_SAMPLING, **(inp.get("sampling") or {})}
@@ -264,12 +279,23 @@ def handler(job):
             wavs.extend(w)
             i += step
         except Exception as e:
-            msg = str(e).lower()
-            if ("out of memory" not in msg) or step == 1:
-                return {"error": f"генерация: {e}"}
+            # str(e) is empty for a lot of torch/dynamo exceptions, so the
+            # traceback and the type name have to be part of what we match on.
+            trace = traceback.format_exc()
+            msg = f"{e} {type(e).__name__} {trace}".lower()
+
+            if any(k in msg for k in ("cudagraph", "torch_dynamo", "dynamo",
+                                      "recompile", "inductor", "triton")):
+                if _disable_compile():
+                    continue          # same slice again, now in eager mode
+                return {"error": f"генерация: {_describe(e)}"}
+
+            if "out of memory" not in msg or step == 1:
+                return {"error": f"генерация: {_describe(e)}"}
+
             step = max(1, step // 2)
             torch.cuda.empty_cache()
-            print(f"[worker] OOM — batch -> {step}", flush=True)
+            print(f"[worker] OOM, batch -> {step}", flush=True)
     gen_sec = time.time() - t0
 
     clips, audio_sec = [], 0.0
