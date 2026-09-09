@@ -174,26 +174,36 @@ def _quietest_stretch(speech, sr):
     while peaking at -24 is a consonant with silence around it."""
     win = max(1, int(sr * 0.025))
     n = speech.size // win
-    if n < 8:
+    if n < 4:
         return None
     frames = speech[:n * win].reshape(n, win)
     rms = np.sqrt((frames ** 2).mean(axis=1))
-    need = min(4, n - 2)
     csum = np.concatenate([[0.0], np.cumsum(rms)])
-    runs = (csum[need:] - csum[:-need]) / need
-    if runs.size == 0:
-        return None
-    k = int(np.argmin(runs))
-    seg = speech[k * win:(k + need) * win].copy()
-    mean_rms = float(runs[k])
-    peak = float(np.max(np.abs(seg)))
-    if mean_rms <= 0 or peak <= 0:
-        return None
-    if 20.0 * np.log10(mean_rms) > ROOM_TONE_MAX_DBFS:
-        return None
-    if 20.0 * np.log10(peak) > ROOM_TONE_MAX_PEAK_DBFS:
-        return None
-    return seg
+
+    # Longest usable gap wins: a longer seed tiles with a slower period and so
+    # is less likely to read as a texture. A dense three-second sentence has no
+    # 100ms gap but usually has a 25ms one, and taking that beats giving up and
+    # padding with a hole.
+    for need in (4, 3, 2, 1):
+        if need > n - 2:
+            continue
+        runs = (csum[need:] - csum[:-need]) / need
+        if runs.size == 0:
+            continue
+        k = int(np.argmin(runs))
+        mean_rms = float(runs[k])
+        if mean_rms <= 0:
+            continue
+        seg = speech[k * win:(k + need) * win].copy()
+        peak = float(np.max(np.abs(seg)))
+        if peak <= 0:
+            continue
+        if 20.0 * np.log10(mean_rms) > ROOM_TONE_MAX_DBFS:
+            continue
+        if 20.0 * np.log10(peak) > ROOM_TONE_MAX_PEAK_DBFS:
+            continue
+        return seg
+    return None
 
 
 def _tile_tone(seg, n):
