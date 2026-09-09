@@ -41,13 +41,15 @@ DEFAULT_SAMPLING = {
 
 # Edge shaping. These must stay identical to qwen_engine.py: a batch that is
 # split between the cloud and this machine has to come back sounding the same.
-HEAD_SILENCE_SEC = 0.12
-TAIL_SILENCE_SEC = 0.40
+HEAD_SILENCE_SEC = 0.06
+TAIL_SILENCE_SEC = 0.08
 EDGE_FADE_SEC = 0.012
 DECAY_KEEP_SEC = 0.20
 ROOM_TONE_MAX_DBFS = -38.0
 ROOM_TONE_MAX_PEAK_DBFS = -34.0
-ROOM_RAMP_SEC = 0.04
+ROOM_TONE_BELOW_SPEECH_DB = 44.0
+ROOM_TONE_MAX_GAIN_DB = 18.0
+ROOM_RAMP_SEC = 0.0
 
 _model = None
 _model_lock = threading.Lock()
@@ -216,6 +218,28 @@ def _tile_tone(seg, n):
     return np.concatenate(parts)[:n].astype("float32").copy()
 
 
+def _speech_level(speech, sr):
+    """The clip's speaking level: 75th percentile of 10ms window RMS."""
+    w = max(1, int(sr * 0.010))
+    n = speech.size // w
+    if n < 2:
+        return float(np.sqrt((speech ** 2).mean()))
+    frames = np.sqrt((speech[:n * w].reshape(n, w) ** 2).mean(axis=1))
+    return float(np.percentile(frames, 75))
+
+
+def _match_room_level(seg, seg_rms, speech, sr):
+    """Scale the background so the pause sits the same distance under the
+    speech as in the source recording these voices were cloned from."""
+    if seg_rms <= 0:
+        return seg
+    target = _speech_level(speech, sr) * (10.0 ** (-ROOM_TONE_BELOW_SPEECH_DB / 20.0))
+    if target <= 0:
+        return seg
+    gain = min(10.0 ** (ROOM_TONE_MAX_GAIN_DB / 20.0), target / seg_rms)
+    return (seg * np.float32(gain)).astype("float32")
+
+
 def _shape_pad(pad, outer_ramp, inner_ramp, at_head):
     """Ramp a background pad up from silence at the file edge and back down to
     silence where it meets the speech, so neither seam is a step."""
@@ -283,6 +307,7 @@ def normalize_edges(wav, sr, head_sec=HEAD_SILENCE_SEC, tail_sec=TAIL_SILENCE_SE
 
     seg = _quietest_stretch(speech, sr)
     if seg is not None:
+        seg = _match_room_level(seg, float(np.sqrt((seg ** 2).mean())), speech, sr)
         outer = int(sr * ROOM_RAMP_SEC)
         head = _shape_pad(_tile_tone(seg, head_n), outer, fade_n, True)
         tail = _shape_pad(_tile_tone(seg, tail_n), outer, fade_n, False)
