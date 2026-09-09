@@ -36,12 +36,18 @@ WORKING_SET_FACTOR = 1.25
 VRAM_HEADROOM_GB = 1.0
 
 DEFAULT_SAMPLING = {
-    "temperature": 0.8, "top_p": 1.0, "top_k": 50, "repetition_penalty": 1.05,
+    "temperature": 0.7, "top_p": 1.0, "top_k": 50, "repetition_penalty": 1.05,
 }
 
+# Edge shaping. These must stay identical to qwen_engine.py: a batch that is
+# split between the cloud and this machine has to come back sounding the same.
 HEAD_SILENCE_SEC = 0.12
-TAIL_SILENCE_SEC = 0.15
-EDGE_FADE_SEC = 0.008
+TAIL_SILENCE_SEC = 0.40
+EDGE_FADE_SEC = 0.012
+DECAY_KEEP_SEC = 0.20
+ROOM_TONE_MAX_DBFS = -38.0
+ROOM_TONE_MAX_PEAK_DBFS = -34.0
+ROOM_RAMP_SEC = 0.04
 
 _model = None
 _model_lock = threading.Lock()
@@ -161,31 +167,123 @@ def get_prompt(model, ref_id: str, ref_audio_b64: str, ref_text: str):
 
 
 # ─────────────────────── Audio shaping ───────────────────────
+def _quietest_stretch(speech, sr):
+    """The quietest ~100ms inside a clip — an inter-word gap, i.e. its
+    background — or None when nothing in the clip is quiet enough to copy.
+    Both the mean and the peak must pass: a stretch that averages -40 dBFS
+    while peaking at -24 is a consonant with silence around it."""
+    win = max(1, int(sr * 0.025))
+    n = speech.size // win
+    if n < 8:
+        return None
+    frames = speech[:n * win].reshape(n, win)
+    rms = np.sqrt((frames ** 2).mean(axis=1))
+    need = min(4, n - 2)
+    csum = np.concatenate([[0.0], np.cumsum(rms)])
+    runs = (csum[need:] - csum[:-need]) / need
+    if runs.size == 0:
+        return None
+    k = int(np.argmin(runs))
+    seg = speech[k * win:(k + need) * win].copy()
+    mean_rms = float(runs[k])
+    peak = float(np.max(np.abs(seg)))
+    if mean_rms <= 0 or peak <= 0:
+        return None
+    if 20.0 * np.log10(mean_rms) > ROOM_TONE_MAX_DBFS:
+        return None
+    if 20.0 * np.log10(peak) > ROOM_TONE_MAX_PEAK_DBFS:
+        return None
+    return seg
+
+
+def _tile_tone(seg, n):
+    """Fill n samples with the background segment, mirroring every other copy
+    so the loop seam is continuous instead of a step."""
+    if seg is None or seg.size == 0 or n <= 0:
+        return None
+    reps = -(-n // seg.size)
+    parts = [seg if i % 2 == 0 else seg[::-1] for i in range(reps)]
+    return np.concatenate(parts)[:n].astype("float32").copy()
+
+
+def _shape_pad(pad, outer_ramp, inner_ramp, at_head):
+    """Ramp a background pad up from silence at the file edge and back down to
+    silence where it meets the speech, so neither seam is a step."""
+    if pad is None or pad.size == 0:
+        return pad
+    o = min(outer_ramp, pad.size // 2)
+    i = min(inner_ramp, pad.size - o)
+    if at_head:
+        if o > 1:
+            pad[:o] *= np.linspace(0.0, 1.0, o, dtype="float32")
+        if i > 1:
+            pad[-i:] *= np.linspace(1.0, 0.0, i, dtype="float32")
+    else:
+        if i > 1:
+            pad[:i] *= np.linspace(0.0, 1.0, i, dtype="float32")
+        if o > 1:
+            pad[-o:] *= np.linspace(1.0, 0.0, o, dtype="float32")
+    return pad
+
+
 def normalize_edges(wav, sr, head_sec=HEAD_SILENCE_SEC, tail_sec=TAIL_SILENCE_SEC,
                     fade_sec=EDGE_FADE_SEC):
-    """Give every clip identical air at both ends, then fade the edges so a cut
-    never lands mid-waveform (which clicks on every splice in a montage)."""
+    """Give every clip identical air at both ends and make both seams inaudible.
+
+    Mirror of qwen_engine.normalize_edges — see the long note there. In short:
+    the boundary walks out through the natural decay so a final consonant is
+    not amputated, the fade lands on the edge of the SPEECH rather than on the
+    padding it used to multiply for nothing, and the pad carries the clip's own
+    background instead of digital zero, so a splice is a pause rather than a
+    noise gate slamming shut.
+    """
     if wav.size == 0:
         return wav
+    wav = np.asarray(wav, dtype="float32")
     peak = float(np.max(np.abs(wav)))
     if peak <= 0:
         return wav
-    thresh = max(0.004, peak * 0.02)
-    loud = np.flatnonzero(np.abs(wav) > thresh)
+
+    loud = np.flatnonzero(np.abs(wav) > max(0.004, peak * 0.02))
     if loud.size == 0:
         return wav
-    speech = wav[int(loud[0]):int(loud[-1]) + 1]
-    out = np.concatenate([
-        np.zeros(max(0, int(sr * head_sec)), dtype="float32"),
-        speech,
-        np.zeros(max(0, int(sr * tail_sec)), dtype="float32"),
-    ]).astype("float32")
-    n = int(sr * fade_sec)
-    if n > 1 and out.size > 2 * n:
-        ramp = np.linspace(0.0, 1.0, n, dtype="float32")
-        out[:n] *= ramp
-        out[-n:] *= ramp[::-1]
-    return out
+    start, end = int(loud[0]), int(loud[-1]) + 1
+
+    decay_thr = max(0.0008, peak * 0.004)
+    keep = max(0, int(sr * DECAY_KEEP_SEC))
+    lo = max(0, start - keep)
+    pre = np.flatnonzero(np.abs(wav[lo:start]) > decay_thr)
+    if pre.size:
+        start = lo + int(pre[0])
+    hi = min(wav.size, end + keep)
+    post = np.flatnonzero(np.abs(wav[end:hi]) > decay_thr)
+    if post.size:
+        end = end + int(post[-1]) + 1
+
+    speech = wav[start:end].copy()
+
+    fade_n = int(sr * fade_sec)
+    if fade_n > 1 and speech.size > 2 * fade_n:
+        ramp = np.linspace(0.0, 1.0, fade_n, dtype="float32")
+        speech[:fade_n] *= ramp
+        speech[-fade_n:] *= ramp[::-1]
+
+    head_n = max(0, int(sr * head_sec))
+    tail_n = max(0, int(sr * tail_sec))
+
+    seg = _quietest_stretch(speech, sr)
+    if seg is not None:
+        outer = int(sr * ROOM_RAMP_SEC)
+        head = _shape_pad(_tile_tone(seg, head_n), outer, fade_n, True)
+        tail = _shape_pad(_tile_tone(seg, tail_n), outer, fade_n, False)
+    else:
+        head = tail = None
+    if head is None:
+        head = np.zeros(head_n, dtype="float32")
+    if tail is None:
+        tail = np.zeros(tail_n, dtype="float32")
+
+    return np.concatenate([head, speech, tail]).astype("float32")
 
 
 def encode_flac(wav, sr) -> str:
