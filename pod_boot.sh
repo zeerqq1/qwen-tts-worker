@@ -32,7 +32,15 @@ REPO_TAR="${POD_REPO_TAR:-https://codeload.github.com/zeerqq1/qwen-tts-worker/ta
 DIR=/workspace/worker
 MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen3-TTS-12Hz-1.7B-Base}"
 MODEL_DIR="${QWEN_MODEL_DIR:-/workspace/qwen3-tts-1.7b-base}"
-export QWEN_MODEL_DIR
+# With a value, not by name. "export QWEN_MODEL_DIR" exported nothing: the path
+# had gone into MODEL_DIR, and bash does not put an unset variable into a
+# child's environment at all. engine.py then read "" and fell back to the repo
+# id, so every pod downloaded the same 4.2GB a SECOND time inside
+# from_pretrained — anonymously, and without the retries the snapshot below
+# has. That second download is what left four pods out of five serving /health
+# with model_loaded=false.
+export QWEN_MODEL_DIR="$MODEL_DIR"
+export QWEN_MODEL_ID="$MODEL_ID"
 PIP="python -m pip install -q --no-cache-dir --break-system-packages"
 
 log() { echo "[boot] $*" >&2; }
