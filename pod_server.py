@@ -57,6 +57,11 @@ _last_job = time.time()
 # machine that had not booted at all, and said so in the log — wrongly.
 _load_error = ""
 _loading = True
+# Generations in flight. A batch of 5400 characters can hold the GPU for
+# minutes, and /generate only touches the clock on the way in and on the way
+# out — so a long job looked exactly like an abandoned pod and could be killed
+# halfway through its own work.
+_busy = 0
 _lock = threading.Lock()
 # The model is not thread-safe: two generations running at once corrupt each
 # other's tensors ("size of tensor a (16) must match ..."). Flask serves
@@ -100,7 +105,10 @@ def _watchdog():
         with _lock:
             idle = time.time() - _last_seen
             no_work = time.time() - _last_job
+            busy = _busy
         alive = time.time() - _started
+        if busy:
+            continue          # working is the opposite of abandoned
         if _loading:
             # The port is not even open yet, so silence here means nothing.
             if alive > LOAD_TIMEOUT_SEC:
@@ -187,9 +195,16 @@ def generate():
         return jsonify({"error": "bad token"}), 401
     _touch()
     _touch_job()
-    with _gpu_lock:
-        _touch()  # waiting for the lock still counts as being talked to
-        out = engine.generate(request.get_json(silent=True) or {})
+    global _busy
+    with _lock:
+        _busy += 1
+    try:
+        with _gpu_lock:
+            _touch()  # waiting for the lock still counts as being talked to
+            out = engine.generate(request.get_json(silent=True) or {})
+    finally:
+        with _lock:
+            _busy -= 1
     _touch()      # generation can take minutes; do not let the watchdog fire
     if out.get("error"):
         return jsonify(out), 500
@@ -225,5 +240,9 @@ if __name__ == "__main__":
         print(f"[pod] модель не загрузилась: {_load_error}", flush=True)
 
     _loading = False
-    _last_job = time.time()      # the no-work clock starts when serving does
+    # Both clocks start when serving starts. Leaving _last_seen at import time
+    # meant a load slower than POD_IDLE_EXIT_SEC produced a pod that killed
+    # itself in the first second of being useful — having paid for the whole
+    # boot to get there.
+    _last_job = _last_seen = time.time()
     app.run(host="0.0.0.0", port=PORT, threaded=True)
