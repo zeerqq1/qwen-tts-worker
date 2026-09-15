@@ -45,6 +45,14 @@ PIP="python -m pip install -q --no-cache-dir --break-system-packages"
 
 log() { echo "[boot] $*" >&2; }
 
+# The length of this log is the only progress signal the studio has, and the
+# two longest steps — pip -q and snapshot_download — print nothing at all while
+# they run. A minute of that on a slow host is indistinguishable from a wedged
+# boot, and gets the machine destroyed for being healthy but quiet. Killed
+# before the hand-over, so that a pod which stops working stops printing too.
+( while :; do sleep 20; echo "[boot] ...идёт загрузка"; done ) &
+HEARTBEAT_PID=$!
+
 # Where the minutes actually go. Written as epoch seconds and served by
 # /health, so boot can be measured instead of guessed at — including the
 # image pull, which happens before this script exists and is only visible
@@ -149,6 +157,7 @@ log "всё на месте, поднимаю сервер"
 # Hand the port over to the real server, and make sure it is actually free:
 # a port still held by the placeholder would keep this pod "not ready"
 # forever while billing.
+kill "$HEARTBEAT_PID" 2>/dev/null; wait "$HEARTBEAT_PID" 2>/dev/null
 kill "$STATUS_PID" 2>/dev/null; wait "$STATUS_PID" 2>/dev/null
 for i in 1 2 3 4 5; do
     # connect_ex is 0 when something still answers on the port. Exit 0 then
