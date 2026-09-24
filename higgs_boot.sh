@@ -213,6 +213,37 @@ else
         kill $MODEL_PID 2>/dev/null; exit 1
     fi
 fi
+# ── 3b. Whatever the server still asks for, by name. ──
+#
+# This image is nearly complete and missing the odd package (msgpack, on the
+# pod that taught this). The server names the module in its ModuleNotFoundError,
+# so install that one module and ask again. Bounded, and never a resolving
+# install: re-resolving the dependency set is what broke the first pods.
+pip_name() {
+    case "$1" in
+        zmq) echo pyzmq ;; PIL) echo pillow ;; cv2) echo opencv-python-headless ;;
+        yaml) echo pyyaml ;; sklearn) echo scikit-learn ;; attr) echo attrs ;;
+        google) echo protobuf ;; *) echo "$1" ;;
+    esac
+}
+probe_imports() {
+    # Both the plugin and the entry point the pod actually runs.
+    "$PY" -c "import sglang_omni.models.higgs_tts, sglang_omni.cli" 2>&1
+}
+for _ in 1 2 3 4 5 6 7 8; do
+    out=$(probe_imports) || true
+    miss=$(printf '%s\n' "$out" | sed -n "s/.*No module named '\([^']*\)'.*/\1/p" | head -1)
+    [ -z "$miss" ] && break
+    pkg=$(pip_name "${miss%%.*}")
+    log "серверу не хватает модуля $miss — ставлю пакет $pkg"
+    $PIP "$pkg" || $PIP --ignore-installed "$pkg" || { log "ПРОВАЛ: $pkg не встал"; break; }
+done
+if ! "$PY" -c "import sglang_omni.models.higgs_tts, sglang_omni.cli" 2>/dev/null; then
+    log "ПРОВАЛ: сервер всё ещё не импортируется:"
+    probe_imports | tail -6
+    kill $MODEL_PID 2>/dev/null; exit 1
+fi
+
 log "sgl-omni: $SGL_CMD · sglang $($PY -c 'import importlib.metadata as m; print(m.version(\"sglang\"))' 2>/dev/null || echo '?')"
 mark pip_done
 
@@ -229,12 +260,27 @@ $SGL_CMD serve --model-path "$MODEL_ID" --host 127.0.0.1 --port "$UP_PORT" \
     --allowed-local-media-path "$REFS_DIR" &
 SGL_PID=$!
 
+SGL_TRIES=0
 for i in $(seq 1 240); do
     if "$PY" -c "import sys,urllib.request; urllib.request.urlopen('http://127.0.0.1:${UP_PORT}/v1/models', timeout=5)" 2>/dev/null; then
         log "SGLang отвечает"
         break
     fi
     if ! kill -0 "$SGL_PID" 2>/dev/null; then
+        # It named what it was missing on the way out; install that and retry
+        # once, rather than throw away a pod that has already paid for its
+        # image and its weights.
+        miss=$(tail -80 /workspace/boot.log | sed -n "s/.*No module named '\([^']*\)'.*/\1/p" | tail -1)
+        SGL_TRIES=$((SGL_TRIES + 1))
+        if [ -n "$miss" ] && [ "$SGL_TRIES" -le 3 ]; then
+            pkg=$(pip_name "${miss%%.*}")
+            log "sgl-omni упал без модуля $miss — ставлю $pkg и пробую снова"
+            $PIP "$pkg" || $PIP --ignore-installed "$pkg"
+            $SGL_CMD serve --model-path "$MODEL_ID" --host 127.0.0.1 --port "$UP_PORT" \
+                --allowed-local-media-path "$REFS_DIR" &
+            SGL_PID=$!
+            continue
+        fi
         log "ПРОВАЛ: sgl-omni завершился на старте"
         exit 1
     fi
