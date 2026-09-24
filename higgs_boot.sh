@@ -62,20 +62,33 @@ mark script_start
 HEARTBEAT_PID=$!
 
 self_terminate() {
+    # The worker's own helper once the code is on disk; before that, the same
+    # chain inline. The injected key is pod-scoped and the REST API answers it
+    # with 403 (measured) — the GraphQL mutations are what it is for.
+    if [ -f "$DIR/pod_lifecycle.py" ]; then
+        (cd "$DIR" && "$PY" -c "import sys, pod_lifecycle; pod_lifecycle._end_pod(__import__('os').environ.get('RUNPOD_POD_ID',''), __import__('os').environ.get('RUNPOD_API_KEY','')); print('[boot] ' + sys.argv[1], file=sys.stderr)" "$1") && return 0
+    fi
     "$PY" - "$1" <<'PY'
-import os, sys, urllib.request
+import json, os, sys, urllib.request
 pod, key = os.environ.get("RUNPOD_POD_ID", ""), os.environ.get("RUNPOD_API_KEY", "")
 print("[boot] " + sys.argv[1] + " — снимаю под", file=sys.stderr, flush=True)
+H = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+attempts = [("DELETE", "https://rest.runpod.io/v1/pods/" + pod, None),
+            ("POST", "https://api.runpod.io/graphql", {"query": 'mutation { podTerminate(input: {podId: "%s"}) }' % pod}),
+            ("POST", "https://rest.runpod.io/v1/pods/" + pod + "/stop", None),
+            ("POST", "https://api.runpod.io/graphql", {"query": 'mutation { podStop(input: {podId: "%s"}) { id } }' % pod})]
 if pod and key:
-    for method, url in (("DELETE", "https://rest.runpod.io/v1/pods/" + pod),
-                        ("POST", "https://rest.runpod.io/v1/pods/" + pod + "/stop")):
+    for method, url, body in attempts:
         try:
-            req = urllib.request.Request(url, method=method, headers={"Authorization": "Bearer " + key})
+            req = urllib.request.Request(url, method=method, headers=H, data=json.dumps(body).encode() if body else None)
             with urllib.request.urlopen(req, timeout=30) as r:
-                print("[boot] " + method + " -> " + str(r.status), file=sys.stderr, flush=True)
+                text = r.read().decode("utf-8", "replace")[:200]
+                if body and '"errors"' in text:
+                    raise RuntimeError(text)
+                print("[boot] " + method + " " + url[-24:] + " -> " + str(r.status) + " " + text, file=sys.stderr, flush=True)
             break
         except Exception as e:
-            print("[boot] " + method + " не удался: " + str(e), file=sys.stderr, flush=True)
+            print("[boot] " + method + " " + url[-24:] + " не удался: " + str(e), file=sys.stderr, flush=True)
 PY
 }
 ( sleep "${POD_LOAD_TIMEOUT_SEC:-1800}"; self_terminate "загрузка не уложилась в ${POD_LOAD_TIMEOUT_SEC:-1800} с"; ) &
@@ -165,18 +178,47 @@ pip_name() {
         google) echo protobuf ;; *) echo "$1" ;;
     esac
 }
-probe_imports() { "$PY" -c "import sglang_omni.models.higgs_tts, sglang_omni.cli" 2>&1; }
-for _ in 1 2 3 4 5 6 7 8; do
-    out=$(probe_imports) || true
-    miss=$(printf '%s\n' "$out" | sed -n "s/.*No module named '\([^']*\)'.*/\1/p" | head -1)
-    [ -z "$miss" ] && break
-    pkg=$(pip_name "${miss%%.*}")
-    log "серверу не хватает модуля $miss — ставлю $pkg"
-    $PIP "$pkg" || $PIP --ignore-installed "$pkg" || break
+# sglang's optional accelerators (expert-parallel MoE, DeepGEMM) assert a
+# CUDA toolkit when imported; a runtime image has none, and sglang guards
+# those imports only against ImportError. Higgs is not MoE — the packages
+# are dead weight here, and removed before they can take the server down.
+for opt in sgl-deep-ep; do
+    "$PY" -m pip show -q "$opt" 2>/dev/null && { log "снимаю $opt (ему нужен CUDA toolkit, серверу он не нужен)"; "$PY" -m pip uninstall -y -q --break-system-packages "$opt" >/dev/null 2>&1 || true; }
 done
-if ! "$PY" -c "import sglang_omni.models.higgs_tts, sglang_omni.cli" 2>/dev/null; then
-    log "плагин Higgs не импортируется:"; probe_imports | tail -8
-    die "sglang_omni не импортируется"
+
+# The probe imports what the server will import — the model runner, not
+# just the plugin — so a failure shows up here, in seconds, and not as a
+# dead server after the weights are loaded.
+PROBE="import sglang.srt.model_executor.model_runner, sglang_omni.models.higgs_tts, sglang_omni.cli"
+probe_imports() { "$PY" -c "$PROBE" 2>&1; }
+uninstall_name() {
+    case "$1" in
+        deep_ep) echo sgl-deep-ep ;; deep_gemm) echo sgl-deep-gemm ;; *) echo "$1" ;;
+    esac
+}
+for _ in 1 2 3 4 5 6 7 8; do
+    out=$(probe_imports) && break
+    miss=$(printf '%s\n' "$out" | sed -n "s/.*No module named '\([^']*\)'.*/\1/p" | head -1)
+    if [ -n "$miss" ]; then
+        pkg=$(pip_name "${miss%%.*}")
+        log "серверу не хватает модуля $miss — ставлю $pkg"
+        $PIP "$pkg" || $PIP --ignore-installed "$pkg" || break
+        continue
+    fi
+    # Not a missing module: some package blew up while initialising. The last
+    # frame names it; if it is an optional accelerator, drop it and try again.
+    broken=$(printf '%s\n' "$out" | sed -n 's#.*[/-]packages/\([A-Za-z0-9_]*\)/__init__\.py.*#\1#p' | tail -1)
+    case "$broken" in
+        deep_ep|deep_gemm)
+            log "пакет $broken не инициализируется на этом образе — снимаю $(uninstall_name "$broken")"
+            "$PY" -m pip uninstall -y -q --break-system-packages "$(uninstall_name "$broken")" >/dev/null 2>&1 || break
+            ;;
+        *) break ;;
+    esac
+done
+if ! "$PY" -c "$PROBE" 2>/dev/null; then
+    log "сервер не импортируется:"; probe_imports | tail -12
+    die "sglang / sglang_omni не импортируется"
 fi
 SGL_CMD="sgl-omni"; command -v sgl-omni >/dev/null 2>&1 || SGL_CMD="$PY -m sglang_omni.cli"
 log "сервер: $SGL_CMD · sglang $("$PY" -c 'import importlib.metadata as m; print(m.version("sglang"))' 2>/dev/null || echo '?') · torch $("$PY" -c 'import torch; print(torch.__version__)' 2>/dev/null)"

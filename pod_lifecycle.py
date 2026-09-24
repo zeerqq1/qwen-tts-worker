@@ -14,11 +14,13 @@ RunPod injects RUNPOD_POD_ID and a pod-scoped RUNPOD_API_KEY into every pod, so
 the pod can call the same REST endpoint the studio uses.
 """
 
+import json
 import os
 import time
 import urllib.request
 
 REST = "https://rest.runpod.io/v1"
+GRAPHQL = "https://api.runpod.io/graphql"
 
 
 def self_terminate(reason: str, exit_code: int = 0):
@@ -27,20 +29,42 @@ def self_terminate(reason: str, exit_code: int = 0):
     pod_id = os.environ.get("RUNPOD_POD_ID", "")
     key = os.environ.get("RUNPOD_API_KEY", "")
     if pod_id and key:
-        for method, url in (("DELETE", f"{REST}/pods/{pod_id}"),
-                            ("POST", f"{REST}/pods/{pod_id}/stop")):
-            try:
-                req = urllib.request.Request(url, method=method, headers={
-                    "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=30) as r:
-                    print(f"[pod] {method} {url.rsplit('/', 1)[-1]}: {r.status}", flush=True)
-                break
-            except Exception as e:
-                print(f"[pod] {method} не удался: {e}", flush=True)
+        _end_pod(pod_id, key)
     else:
         print("[pod] RUNPOD_POD_ID/RUNPOD_API_KEY нет в окружении — только выхожу", flush=True)
     time.sleep(2)
     os._exit(exit_code)
+
+
+def _end_pod(pod_id: str, key: str) -> bool:
+    """Every way this pod can end itself, in order, until one is accepted.
+
+    The key RunPod injects is scoped to the pod, and the REST API answers it
+    with 403 (measured). The GraphQL mutations are what a pod-scoped key is
+    for. REST is still tried first: a full key, if one were ever given,
+    works there too.
+    """
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    attempts = (
+        ("DELETE", f"{REST}/pods/{pod_id}", None),
+        ("GQL", GRAPHQL, {"query": 'mutation { podTerminate(input: {podId: "%s"}) }' % pod_id}),
+        ("POST", f"{REST}/pods/{pod_id}/stop", None),
+        ("GQL", GRAPHQL, {"query": 'mutation { podStop(input: {podId: "%s"}) { id desiredStatus } }' % pod_id}),
+    )
+    for method, url, body in attempts:
+        try:
+            data = json.dumps(body).encode() if body else None
+            req = urllib.request.Request(url, method="POST" if method == "GQL" else method,
+                                         headers=headers, data=data)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                text = r.read().decode("utf-8", "replace")[:200]
+                if method == "GQL" and '"errors"' in text:
+                    raise RuntimeError(text)
+                print(f"[pod] {method} {url.rsplit('/', 1)[-1]}: {r.status} {text}", flush=True)
+            return True
+        except Exception as e:
+            print(f"[pod] {method} {url.rsplit('/', 1)[-1]} не удался: {e}", flush=True)
+    return False
 
 
 def boot_marks(path: str = "/workspace/boot_times.txt") -> dict:
