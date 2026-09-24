@@ -92,6 +92,27 @@ mark code_done
 cd "$DIR" || exit 1
 mkdir -p "$REFS_DIR"
 
+# ── 1b. The interpreter that actually has the model stack in it. ──
+#
+# This image ships its environment in a virtualenv, not in /usr/bin/python3,
+# and the difference is not cosmetic: the system interpreter has no sglang, so
+# installing the server there tries to resolve torch, flash-attn and the rest
+# from scratch and ends in ResolutionImpossible. Pick the interpreter that
+# already imports sglang; everything after this point uses it.
+log "кандидаты: $(ls -d /sgl-workspace/*/.venv/bin/python /sgl-workspace/.venv/bin/python /opt/*/.venv/bin/python /opt/venv/bin/python /usr/local/bin/python3 /usr/bin/python3 2>/dev/null | tr '\n' ' ')"
+for cand in $(ls -d /sgl-workspace/*/.venv/bin/python /sgl-workspace/.venv/bin/python \
+                   /opt/*/.venv/bin/python /opt/venv/bin/python /root/.venv/bin/python \
+                   /workspace/.venv/bin/python /usr/local/bin/python3 /usr/bin/python3 2>/dev/null); do
+    [ -x "$cand" ] || continue
+    if "$cand" -c "import sglang" 2>/dev/null; then
+        PY="$cand"
+        log "рабочее окружение: $PY (sglang $("$PY" -c 'import importlib.metadata as m; print(m.version("sglang"))' 2>/dev/null))"
+        break
+    fi
+done
+PIP="$PY -m pip install -q --no-cache-dir --break-system-packages"
+log "питон для сервера и обёртки: $PY"
+
 # ── 2. Weights, in the background: the single biggest item starts first. ──
 #
 # Install as little as possible. This image is a working SGLang environment with
@@ -175,9 +196,16 @@ else
             log "ПРОВАЛ: не удалось склонировать sglang-omni"; kill $MODEL_PID 2>/dev/null; exit 1; }
         SRC=/opt/sglang-omni
     fi
-    log "ставлю sglang-omni из $SRC (со всеми зависимостями, как в официальном рецепте)"
-    log "sglang в образе: $($PY -c 'import importlib.metadata as m; print(m.version(\"sglang\"))' 2>/dev/null || echo 'нет')"
-    retry $PIP -e "$SRC" || { log "ПРОВАЛ: не удалось поставить sglang-omni"; kill $MODEL_PID 2>/dev/null; exit 1; }
+    log "ставлю sglang-omni из $SRC в $PY"
+    # --no-deps first: in an environment that already has the stack, this is
+    # all that is needed and it cannot disturb the pins. Only if the plugin
+    # still will not import do we let pip resolve dependencies.
+    $PIP --no-deps -e "$SRC" || log "установка без зависимостей не прошла"
+    set_cmd
+    if [ -z "$SGL_CMD" ] || ! higgs_ok; then
+        log "плагин не поднялся — ставлю с зависимостями"
+        retry $PIP -e "$SRC" || { log "ПРОВАЛ: не удалось поставить sglang-omni"; kill $MODEL_PID 2>/dev/null; exit 1; }
+    fi
     set_cmd
     if [ -z "$SGL_CMD" ] || ! higgs_ok; then
         log "плагин Higgs не импортируется после установки — подробности:"
