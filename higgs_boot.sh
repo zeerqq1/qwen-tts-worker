@@ -147,31 +147,45 @@ mark download_started
 # container. Three ways to find it, cheapest first; the git install is --no-deps
 # because everything it needs is already here, and letting pip re-resolve the
 # dependency set is exactly what broke the first attempt.
+# The only check that means anything: the Higgs plugin itself has to import.
+# The server loads its model backends optionally and prints "Ignore import
+# error when loading sglang_omni.models.higgs_tts: ..." when one of them cannot
+# be loaded — then serves happily with no Higgs in it.
+higgs_ok() { "$PY" -c "import sglang_omni.models.higgs_tts" 2>/dev/null; }
+set_cmd() {
+    if command -v sgl-omni >/dev/null 2>&1; then SGL_CMD="sgl-omni"
+    elif "$PY" -c "import sglang_omni.cli" 2>/dev/null; then SGL_CMD="$PY -m sglang_omni.cli"
+    else SGL_CMD=""; fi
+}
+
 SGL_CMD=""
-if command -v sgl-omni >/dev/null 2>&1; then
-    SGL_CMD="sgl-omni"
-elif "$PY" -c "import sglang_omni" 2>/dev/null; then
-    SGL_CMD="$PY -m sglang_omni.cli"
+set_cmd
+if [ -n "$SGL_CMD" ] && higgs_ok; then
+    log "sgl-omni уже в образе и плагин Higgs на месте"
 else
-    for v in /sgl-workspace/sglang-omni/.venv /sgl-workspace/.venv /opt/sglang-omni/.venv /workspace/.venv /root/.venv; do
-        if [ -x "$v/bin/sgl-omni" ]; then export PATH="$v/bin:$PATH"; SGL_CMD="sgl-omni"; log "sgl-omni найден в $v"; break; fi
+    # An editable install of whatever source the image already carries beats a
+    # fresh clone: it is the version this image's sglang was built against.
+    SRC=""
+    for d in /sgl-workspace/sglang-omni /opt/sglang-omni /workspace/sglang-omni /root/sglang-omni; do
+        [ -f "$d/pyproject.toml" ] && { SRC="$d"; break; }
     done
-fi
-if [ -z "$SGL_CMD" ]; then
-    log "sgl-omni нет в образе — ставлю репозиторий без зависимостей"
-    retry git clone --depth 1 https://github.com/sgl-project/sglang-omni /opt/sglang-omni || {
-        log "ПРОВАЛ: не удалось склонировать sglang-omni"; kill $MODEL_PID 2>/dev/null; exit 1; }
-    $PIP --no-deps -e /opt/sglang-omni || log "установка без зависимостей не прошла"
-    if command -v sgl-omni >/dev/null 2>&1; then
-        SGL_CMD="sgl-omni"
-    elif "$PY" -c "import sglang_omni" 2>/dev/null; then
-        SGL_CMD="$PY -m sglang_omni.cli"
-    else
-        log "ПРОВАЛ: sglang_omni не импортируется даже после установки"
+    if [ -z "$SRC" ]; then
+        log "исходников sglang-omni в образе нет — клонирую"
+        retry git clone --depth 1 https://github.com/sgl-project/sglang-omni /opt/sglang-omni || {
+            log "ПРОВАЛ: не удалось склонировать sglang-omni"; kill $MODEL_PID 2>/dev/null; exit 1; }
+        SRC=/opt/sglang-omni
+    fi
+    log "ставлю sglang-omni из $SRC (со всеми зависимостями, как в официальном рецепте)"
+    log "sglang в образе: $($PY -c 'import importlib.metadata as m; print(m.version(\"sglang\"))' 2>/dev/null || echo 'нет')"
+    retry $PIP -e "$SRC" || { log "ПРОВАЛ: не удалось поставить sglang-omni"; kill $MODEL_PID 2>/dev/null; exit 1; }
+    set_cmd
+    if [ -z "$SGL_CMD" ] || ! higgs_ok; then
+        log "плагин Higgs не импортируется после установки — подробности:"
+        "$PY" -c "import sglang_omni.models.higgs_tts" 2>&1 | tail -5
         kill $MODEL_PID 2>/dev/null; exit 1
     fi
 fi
-log "sgl-omni: $SGL_CMD"
+log "sgl-omni: $SGL_CMD · sglang $($PY -c 'import importlib.metadata as m; print(m.version(\"sglang\"))' 2>/dev/null || echo '?')"
 mark pip_done
 
 log "жду веса"
