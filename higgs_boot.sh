@@ -36,6 +36,10 @@ echo "[boot] $(date -u +%H:%M:%S) старт · $(nvidia-smi --query-gpu=name,dr
 REPO_TAR="${POD_REPO_TAR:-https://codeload.github.com/zeerqq1/qwen-tts-worker/tar.gz/refs/heads/main}"
 DIR=/workspace/worker
 MODEL_ID="${HIGGS_MODEL_ID:-bosonai/higgs-tts-3-4b}"
+# A commit of the weights, not a branch: a push to the repository must not
+# change the voice between two chapters of one project. Empty = whatever main is.
+MODEL_REV="${HIGGS_MODEL_REVISION:-}"
+MODEL_PATH_FILE=/workspace/model_path
 SGL_OMNI_VERSION="${HIGGS_SGL_OMNI_VERSION:-0.1.6}"
 UP_PORT="${HIGGS_UPSTREAM_PORT:-8001}"
 REFS_DIR="${HIGGS_REFS_DIR:-/workspace/refs}"
@@ -115,13 +119,16 @@ retry $PIP -U huggingface_hub || die "huggingface_hub не встал"
 "$PY" -c "import hf_transfer" 2>/dev/null || $PIP hf_transfer >/dev/null 2>&1 || true
 "$PY" -c "import hf_transfer" 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1
 mark pip_hf_done
-log "тяну веса $MODEL_ID (фоном)"
+log "тяну веса $MODEL_ID${MODEL_REV:+ @ ${MODEL_REV:0:8}} (фоном)"
 (
     for attempt in 1 2 3; do
-        "$PY" - "$MODEL_ID" <<'PY' && exit 0
+        "$PY" - "$MODEL_ID" "$MODEL_REV" "$MODEL_PATH_FILE" <<'PY' && exit 0
 import sys
 from huggingface_hub import snapshot_download
-print("[boot] веса в", snapshot_download(sys.argv[1], max_workers=8), file=sys.stderr)
+repo, rev, out = sys.argv[1], sys.argv[2] or None, sys.argv[3]
+path = snapshot_download(repo, revision=rev, max_workers=8)
+open(out, "w").write(path)
+print("[boot] веса в", path, file=sys.stderr)
 PY
         echo "[boot] веса: попытка $attempt не удалась" >&2
         sleep 5
@@ -166,11 +173,13 @@ mark pip_done
 
 log "жду веса"
 wait $MODEL_PID || die "веса не скачались"
+MODEL_DIR=$(cat "$MODEL_PATH_FILE" 2>/dev/null)
+[ -n "$MODEL_DIR" ] && [ -f "$MODEL_DIR/config.json" ] || die "снимок весов без config.json: '$MODEL_DIR'"
 mark weights_done
 
 # ── 4. The model on the private port, the wrapper on the public one. ──
 log "поднимаю SGLang-Omni на :$UP_PORT"
-$SGL_CMD serve --model-path "$MODEL_ID" --host 127.0.0.1 --port "$UP_PORT" \
+$SGL_CMD serve --model-path "$MODEL_DIR" --host 127.0.0.1 --port "$UP_PORT" \
     --allowed-local-media-path "$REFS_DIR" &
 SGL_PID=$!
 SGL_TRIES=0
@@ -186,7 +195,7 @@ for i in $(seq 1 240); do
             pkg=$(pip_name "${miss%%.*}")
             log "sgl-omni упал без модуля $miss — ставлю $pkg и пробую снова"
             $PIP "$pkg" || $PIP --ignore-installed "$pkg"
-            $SGL_CMD serve --model-path "$MODEL_ID" --host 127.0.0.1 --port "$UP_PORT" \
+            $SGL_CMD serve --model-path "$MODEL_DIR" --host 127.0.0.1 --port "$UP_PORT" \
                 --allowed-local-media-path "$REFS_DIR" &
             SGL_PID=$!
             continue

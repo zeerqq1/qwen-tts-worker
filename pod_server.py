@@ -72,8 +72,12 @@ _loading = True
 # minutes, and /generate only touches the clock on the way in and on the way
 # out — so a long job looked exactly like an abandoned pod and could be killed
 # halfway through its own work.
-_busy = 0
-_busy_since = 0.0
+# Requests in flight, each with the moment it started working. The watchdog
+# measures the OLDEST one: with two jobs queued per pod the count never touches
+# zero for the whole batch, and a clock that only reset at zero declared a
+# thirty-minute chapter "one wedged generation" and deleted the machine.
+_inflight: dict = {}
+_req_seq = 0
 _lock = threading.Lock()
 # The model is not thread-safe: two generations running at once corrupt each
 # other's tensors ("size of tensor a (16) must match ..."). Flask serves
@@ -117,8 +121,8 @@ def _watchdog():
         with _lock:
             idle = time.time() - _last_seen
             no_work = time.time() - _last_job
-            busy = _busy
-            busy_for = (time.time() - _busy_since) if (_busy and _busy_since) else 0.0
+            busy = len(_inflight)
+            busy_for = (time.time() - min(_inflight.values())) if _inflight else 0.0
         alive = time.time() - _started
         # The hard ceilings apply whatever the pod is doing: a generate() that
         # never returns used to keep the pod alive forever because «busy»
@@ -207,20 +211,22 @@ def generate():
         return jsonify({"error": "bad token"}), 401
     _touch()
     _touch_job()
-    global _busy, _busy_since
+    global _req_seq
     with _lock:
-        _busy += 1
-        if _busy == 1:
-            _busy_since = time.time()
+        _req_seq += 1
+        rid = _req_seq
+        # Queued behind another job: counted as busy, but its own clock only
+        # starts once it holds the GPU — waiting is not being wedged.
+        _inflight[rid] = time.time() + 10 ** 9
     try:
         with _gpu_lock:
             _touch()  # waiting for the lock still counts as being talked to
+            with _lock:
+                _inflight[rid] = time.time()
             out = engine.generate(request.get_json(silent=True) or {})
     finally:
         with _lock:
-            _busy -= 1
-            if _busy == 0:
-                _busy_since = 0.0
+            _inflight.pop(rid, None)
     _touch()      # generation can take minutes; do not let the watchdog fire
     if out.get("error"):
         return jsonify(out), 500

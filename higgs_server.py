@@ -72,9 +72,13 @@ ATTEMPTS = 3
 # paragraph twice as long as anything the studio's chunker produces.
 FRAMES_PER_SEC = 25
 CHARS_PER_SECOND_FLOOR = 7.0
-MAX_NEW_TOKENS_CAP = 3000
-# The server rejects anything longer outright (MAX_SPEECH_INPUT_CHARS).
-MAX_INPUT_CHARS = 4096
+# SGLang's Higgs stage clamps max_new_tokens to 2048 frames (~82 s of speech)
+# and, when a clip hits it, answers 200 with the audio cut mid-sentence. So the
+# budget never asks for more, and inputs are kept to what 2048 frames carry
+# with margin: ~900 characters is ~60 s at narration pace. The studio's default
+# chunk is 400.
+MAX_NEW_TOKENS_CAP = 2048
+MAX_INPUT_CHARS = 900
 
 app = Flask(__name__)
 _started = time.time()
@@ -83,8 +87,12 @@ _last_seen = time.time()
 _last_job = time.time()
 _load_error = ""
 _loading = True
-_busy = 0
-_busy_since = 0.0
+# Requests in flight, each with the moment it started working. The watchdog
+# measures the OLDEST one: with two jobs queued per pod the count never touches
+# zero for the whole batch, and a clock that only reset at zero declared a
+# thirty-minute chapter "one wedged generation" and deleted the machine.
+_inflight: dict = {}
+_req_seq = 0
 _lock = threading.Lock()
 _ref_lock = threading.Lock()
 _ref_cache: dict = {}
@@ -229,6 +237,11 @@ def _speak(text: str, ref_path: str, ref_text: str, sampling: dict, budget: int,
             r = requests.post(f"{UPSTREAM}/v1/audio/speech", json=body, timeout=UPSTREAM_TIMEOUT)
             if r.status_code >= 400:
                 raise RuntimeError(f"{r.status_code}: {r.text[:300]}")
+            # The server reports a clip that ran into the length ceiling only
+            # in a header. Silence here would write a truncated paragraph.
+            if (r.headers.get("X-Finish-Reason") or "").lower() == "length":
+                raise RuntimeError(f"клип упёрся в предел {MAX_NEW_TOKENS_CAP} кадров и обрезан — "
+                                   f"уменьшите «Макс. чанк» (фрагмент {len(text)} знаков)")
             return _decode_audio(r)
         except Exception as e:
             last = str(e)
@@ -304,8 +317,8 @@ def _watchdog():
         with _lock:
             idle = time.time() - _last_seen
             no_work = time.time() - _last_job
-            busy = _busy
-            busy_for = (time.time() - _busy_since) if (_busy and _busy_since) else 0.0
+            busy = len(_inflight)
+            busy_for = (time.time() - min(_inflight.values())) if _inflight else 0.0
         alive = time.time() - _started
         if alive > MAX_LIFE_SEC:
             pod_lifecycle.self_terminate(f"предельное время жизни {alive:.0f}s")
@@ -359,18 +372,16 @@ def api_generate():
         return jsonify({"error": "bad token"}), 401
     _touch()
     _touch_job()
-    global _busy, _busy_since
+    global _req_seq
     with _lock:
-        _busy += 1
-        if _busy == 1:
-            _busy_since = time.time()
+        _req_seq += 1
+        rid = _req_seq
+        _inflight[rid] = time.time()
     try:
         out = generate(request.get_json(silent=True) or {})
     finally:
         with _lock:
-            _busy -= 1
-            if _busy == 0:
-                _busy_since = 0.0
+            _inflight.pop(rid, None)
     _touch()
     if out.get("error"):
         return jsonify(out), 500
