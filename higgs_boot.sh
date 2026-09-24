@@ -93,19 +93,37 @@ cd "$DIR" || exit 1
 mkdir -p "$REFS_DIR"
 
 # ── 2. Weights, in the background: the single biggest item starts first. ──
-# The SGLang image is Debian-based, and some of what the wrapper needs (blinker,
-# behind flask) is installed by apt. pip then refuses: "cannot uninstall, it is
-# a distutils installed project". --ignore-installed leaves the system copy
-# alone and puts ours beside it, which is exactly right inside a container.
-install_deps() {
-    $PIP huggingface_hub hf_transfer flask requests soundfile numpy && return 0
-    log "pip споткнулся о системный пакет — повторяю с --ignore-installed"
-    $PIP --ignore-installed huggingface_hub hf_transfer flask requests soundfile numpy
+#
+# Install as little as possible. This image is a working SGLang environment with
+# torch, transformers, numpy and huggingface_hub already pinned against each
+# other; a blanket install (and --ignore-installed on top of it) pulled newer
+# numpy and huggingface_hub over them, and eight packages then declared the
+# result incompatible. So: ask Python what is actually missing and install only
+# that. --ignore-installed is a fallback for a package apt owns (flask needs
+# blinker, which pip may refuse to uninstall), never for the numeric stack.
+missing() {
+    local need=""
+    for pair in $1; do
+        pkg="${pair%%:*}"; mod="${pair##*:}"
+        "$PY" -c "import $mod" 2>/dev/null || need="$need $pkg"
+    done
+    echo "$need"
 }
-log "ставлю загрузчик"
+install_deps() {
+    local need
+    need=$(missing "flask:flask requests:requests soundfile:soundfile numpy:numpy huggingface_hub:huggingface_hub")
+    if [ -z "$need" ]; then log "зависимости обёртки уже в образе"; return 0; fi
+    log "ставлю недостающее:$need"
+    $PIP $need && return 0
+    log "pip споткнулся о системном пакете — повторяю с --ignore-installed для:$need"
+    $PIP --ignore-installed $need
+}
+log "проверяю зависимости обёртки"
 retry install_deps || exit 1
+# Several connections instead of one when pulling 8GB. Nice to have, never fatal.
+"$PY" -c "import hf_transfer" 2>/dev/null || $PIP hf_transfer || log "hf_transfer не встал — качаю одним потоком"
 mark pip_hf_done
-export HF_HUB_ENABLE_HF_TRANSFER=1
+"$PY" -c "import hf_transfer" 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1
 log "тяну веса $MODEL_ID (фоном)"
 (
     for attempt in 1 2 3; do
@@ -122,19 +140,38 @@ PY
 MODEL_PID=$!
 mark download_started
 
-# ── 3. The server binary. The SGLang image ships it, but not always on PATH:
-#       the published recipe builds it into a uv venv inside the container. ──
-if ! command -v sgl-omni >/dev/null 2>&1; then
+# ── 3. The server itself.
+#
+# Measured on a live pod: lmsysorg/sglang-omni:dev carries the dependencies but
+# NOT the console script — the published recipe installs the repo inside the
+# container. Three ways to find it, cheapest first; the git install is --no-deps
+# because everything it needs is already here, and letting pip re-resolve the
+# dependency set is exactly what broke the first attempt.
+SGL_CMD=""
+if command -v sgl-omni >/dev/null 2>&1; then
+    SGL_CMD="sgl-omni"
+elif "$PY" -c "import sglang_omni" 2>/dev/null; then
+    SGL_CMD="$PY -m sglang_omni.cli"
+else
     for v in /sgl-workspace/sglang-omni/.venv /sgl-workspace/.venv /opt/sglang-omni/.venv /workspace/.venv /root/.venv; do
-        if [ -x "$v/bin/sgl-omni" ]; then export PATH="$v/bin:$PATH"; log "sgl-omni найден в $v"; break; fi
+        if [ -x "$v/bin/sgl-omni" ]; then export PATH="$v/bin:$PATH"; SGL_CMD="sgl-omni"; log "sgl-omni найден в $v"; break; fi
     done
 fi
-if ! command -v sgl-omni >/dev/null 2>&1; then
-    log "sgl-omni не найден в образе — ставлю из git (это долго)"
-    retry git clone --depth 1 https://github.com/sgl-project/sglang-omni /opt/sglang-omni \
-        && retry $PIP -e /opt/sglang-omni || { log "ПРОВАЛ: не удалось поставить sglang-omni"; kill $MODEL_PID 2>/dev/null; exit 1; }
+if [ -z "$SGL_CMD" ]; then
+    log "sgl-omni нет в образе — ставлю репозиторий без зависимостей"
+    retry git clone --depth 1 https://github.com/sgl-project/sglang-omni /opt/sglang-omni || {
+        log "ПРОВАЛ: не удалось склонировать sglang-omni"; kill $MODEL_PID 2>/dev/null; exit 1; }
+    $PIP --no-deps -e /opt/sglang-omni || log "установка без зависимостей не прошла"
+    if command -v sgl-omni >/dev/null 2>&1; then
+        SGL_CMD="sgl-omni"
+    elif "$PY" -c "import sglang_omni" 2>/dev/null; then
+        SGL_CMD="$PY -m sglang_omni.cli"
+    else
+        log "ПРОВАЛ: sglang_omni не импортируется даже после установки"
+        kill $MODEL_PID 2>/dev/null; exit 1
+    fi
 fi
-log "sgl-omni: $(command -v sgl-omni)"
+log "sgl-omni: $SGL_CMD"
 mark pip_done
 
 log "жду веса"
@@ -146,7 +183,7 @@ mark weights_done
 
 # ── 4. The model on the private port, the wrapper on the public one. ──
 log "поднимаю SGLang-Omni на :$UP_PORT"
-sgl-omni serve --model-path "$MODEL_ID" --host 127.0.0.1 --port "$UP_PORT" \
+$SGL_CMD serve --model-path "$MODEL_ID" --host 127.0.0.1 --port "$UP_PORT" \
     --allowed-local-media-path "$REFS_DIR" &
 SGL_PID=$!
 
