@@ -93,8 +93,17 @@ cd "$DIR" || exit 1
 mkdir -p "$REFS_DIR"
 
 # ── 2. Weights, in the background: the single biggest item starts first. ──
+# The SGLang image is Debian-based, and some of what the wrapper needs (blinker,
+# behind flask) is installed by apt. pip then refuses: "cannot uninstall, it is
+# a distutils installed project". --ignore-installed leaves the system copy
+# alone and puts ours beside it, which is exactly right inside a container.
+install_deps() {
+    $PIP huggingface_hub hf_transfer flask requests soundfile numpy && return 0
+    log "pip споткнулся о системный пакет — повторяю с --ignore-installed"
+    $PIP --ignore-installed huggingface_hub hf_transfer flask requests soundfile numpy
+}
 log "ставлю загрузчик"
-retry $PIP huggingface_hub hf_transfer flask requests soundfile numpy || exit 1
+retry install_deps || exit 1
 mark pip_hf_done
 export HF_HUB_ENABLE_HF_TRANSFER=1
 log "тяну веса $MODEL_ID (фоном)"
