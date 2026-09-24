@@ -16,15 +16,14 @@ whose process exits stops billing, so an abandoned pod cannot quietly run up a
 bill even if the studio crashed, lost its network, or was killed outright.
 """
 
-import json
 import os
 import threading
 import time
-import urllib.request
 
 from flask import Flask, request, jsonify, Response
 
 import engine
+import pod_lifecycle
 
 PORT = int(os.environ.get("POD_PORT", "8000"))
 TOKEN = os.environ.get("POD_TOKEN", "")
@@ -53,34 +52,10 @@ BOOT_LOG = os.environ.get("POD_BOOT_LOG", "/workspace/boot.log")
 BUSY_MAX_SEC = float(os.environ.get("POD_BUSY_MAX_SEC", "1800"))
 
 
-def _self_terminate(reason: str):
-    """End this pod's billing, not just this process.
-
-    Exiting the process was the whole safety net here — and it is not one:
-    RunPod restarts a pod's container when its command exits, so an abandoned
-    pod looped through boot forever and billed until the studio's next launch
-    swept it. RunPod injects RUNPOD_POD_ID and a pod-scoped RUNPOD_API_KEY into
-    every pod, so the pod can delete itself through the same REST call the
-    studio uses. Falls back to /stop, and only then to exiting.
-    """
-    print(f"[pod] {reason} — снимаю под", flush=True)
-    pod_id = os.environ.get("RUNPOD_POD_ID", "")
-    key = os.environ.get("RUNPOD_API_KEY", "")
-    if pod_id and key:
-        for method, url in (("DELETE", f"https://rest.runpod.io/v1/pods/{pod_id}"),
-                            ("POST", f"https://rest.runpod.io/v1/pods/{pod_id}/stop")):
-            try:
-                req = urllib.request.Request(url, method=method, headers={
-                    "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=30) as r:
-                    print(f"[pod] {method} {url.rsplit('/', 1)[-1]}: {r.status}", flush=True)
-                break
-            except Exception as e:
-                print(f"[pod] {method} не удался: {e}", flush=True)
-    else:
-        print("[pod] RUNPOD_POD_ID/RUNPOD_API_KEY нет в окружении — только выхожу", flush=True)
-    time.sleep(2)
-    os._exit(0)
+# Ending this pod's billing lives in pod_lifecycle, shared with higgs_server:
+# one copy, because "the process exited" and "the machine stopped costing
+# money" are not the same thing and the difference is worth a weekend's rent.
+_self_terminate = pod_lifecycle.self_terminate
 
 app = Flask(__name__)
 _started = time.time()
@@ -173,22 +148,7 @@ def _pkg_version(name: str) -> str:
         return ""
 
 
-def _boot_marks() -> dict:
-    """Timing marks pod_boot.sh left behind, as epoch seconds.
-
-    The studio subtracts them from the moment it rented the pod, which is the
-    only way to see the image pull — that happens before any of our code runs
-    and is otherwise invisible.
-    """
-    out = {}
-    try:
-        for line in open("/workspace/boot_times.txt", encoding="utf-8"):
-            name, _, ts = line.strip().partition(" ")
-            if name and ts:
-                out[name] = float(ts)
-    except Exception:
-        pass
-    return out
+_boot_marks = pod_lifecycle.boot_marks
 
 
 @app.get("/health")
