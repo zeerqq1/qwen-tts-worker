@@ -181,7 +181,7 @@ missing() {
 }
 install_deps() {
     local need
-    need=$(missing "flask:flask requests:requests soundfile:soundfile numpy:numpy huggingface_hub:huggingface_hub")
+    need=$(missing "flask:flask requests:requests soundfile:soundfile numpy:numpy huggingface_hub:huggingface_hub msgpack:msgpack")
     if [ -z "$need" ]; then log "зависимости обёртки уже в образе"; return 0; fi
     log "ставлю недостающее:$need"
     $PIP $need && return 0
