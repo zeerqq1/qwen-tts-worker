@@ -182,7 +182,7 @@ pip_name() {
 # CUDA toolkit when imported; a runtime image has none, and sglang guards
 # those imports only against ImportError. Higgs is not MoE — the packages
 # are dead weight here, and removed before they can take the server down.
-for opt in sgl-deep-ep; do
+for opt in sgl-deep-ep sgl-deep-gemm; do
     "$PY" -m pip show -q "$opt" 2>/dev/null && { log "снимаю $opt (ему нужен CUDA toolkit, серверу он не нужен)"; "$PY" -m pip uninstall -y -q --break-system-packages "$opt" >/dev/null 2>&1 || true; }
 done
 
@@ -207,7 +207,7 @@ for _ in 1 2 3 4 5 6 7 8; do
     fi
     # Not a missing module: some package blew up while initialising. The last
     # frame names it; if it is an optional accelerator, drop it and try again.
-    broken=$(printf '%s\n' "$out" | sed -n 's#.*[/-]packages/\([A-Za-z0-9_]*\)/__init__\.py.*#\1#p' | tail -1)
+    broken=$(printf '%s\n' "$out" | sed -n 's#.*[/-]packages/\(deep_ep\|deep_gemm\)/.*#\1#p' | tail -1)
     case "$broken" in
         deep_ep|deep_gemm)
             log "пакет $broken не инициализируется на этом образе — снимаю $(uninstall_name "$broken")"
