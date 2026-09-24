@@ -18,7 +18,7 @@ exec > >(tee -a /workspace/boot.log) 2>&1
 PY=$(command -v python3 || command -v python)
 "$PY" -m http.server "${POD_PORT:-8000}" --bind 0.0.0.0 --directory /workspace >/dev/null 2>&1 &
 STATUS_PID=$!
-echo "[boot] $(date -u +%H:%M:%S) старт · $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || echo 'nvidia-smi недоступен')"
+echo "[boot] $(date -u +%H:%M:%S) старт · $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || echo 'nvidia-smi недоступен') · воркер ${POD_WORKER_REVISION:-main}"
 
 REPO_TAR="${POD_REPO_TAR:-https://codeload.github.com/zeerqq1/qwen-tts-worker/tar.gz/refs/heads/main}"
 DIR=/workspace/worker
