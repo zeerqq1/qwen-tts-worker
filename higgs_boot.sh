@@ -43,7 +43,12 @@ MODEL_PATH_FILE=/workspace/model_path
 SGL_OMNI_VERSION="${HIGGS_SGL_OMNI_VERSION:-0.1.6}"
 UP_PORT="${HIGGS_UPSTREAM_PORT:-8001}"
 REFS_DIR="${HIGGS_REFS_DIR:-/workspace/refs}"
-PIP="$PY -m pip install -q --no-cache-dir --break-system-packages"
+# A wheel cache on the container disk, not --no-cache-dir: on a slow host a
+# multi-gigabyte install that breaks on one wheel must not start over. pip
+# also retries each request ten times with a generous read timeout, so a
+# stalling mirror is waited out instead of failed.
+export PIP_CACHE_DIR=/workspace/pipcache
+PIP="$PY -m pip install -q --break-system-packages --retries 10 --timeout 120"
 
 log() { echo "[boot] $*" >&2; }
 
@@ -117,7 +122,12 @@ mkdir -p "$REFS_DIR"
 # ── 2. Weights, in the background: the single biggest item starts first. ──
 retry $PIP -U huggingface_hub || die "huggingface_hub не встал"
 "$PY" -c "import hf_transfer" 2>/dev/null || $PIP hf_transfer >/dev/null 2>&1 || true
-"$PY" -c "import hf_transfer" 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1
+if "$PY" -c "import hf_transfer" 2>/dev/null; then
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    log "веса качает hf_transfer"
+else
+    log "hf_transfer не встал — веса качает обычный загрузчик"
+fi
 mark pip_hf_done
 log "тяну веса $MODEL_ID${MODEL_REV:+ @ ${MODEL_REV:0:8}} (фоном)"
 (
@@ -140,7 +150,8 @@ mark download_started
 
 # ── 3. The server stack, from PyPI, pinned. torch in this image already matches
 #       sglang-omni's pin, so pip resolves the rest without touching it. ──
-log "torch в образе: $("$PY" -c 'import torch; print(torch.__version__, "cuda", torch.version.cuda)' 2>/dev/null || echo 'нет')"
+echo
+log "torch в образе: $("$PY" -c 'import torch; print(torch.__version__, "cuda", torch.version.cuda)' 2>/dev/null || echo 'нет') · python $PY"
 log "ставлю sglang-omni==$SGL_OMNI_VERSION и flask"
 retry $PIP "sglang-omni==$SGL_OMNI_VERSION" flask requests soundfile \
     || die "sglang-omni==$SGL_OMNI_VERSION не установился (см. лог выше)"
