@@ -49,7 +49,7 @@ RUN python -m pip install --no-cache-dir \
 # Bake the weights in, so a cold worker never waits on HuggingFace.
 RUN python -c "\
 from huggingface_hub import snapshot_download; \
-p = snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-Base', local_dir='/models/qwen3-tts-1.7b-base'); \
+p = snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-Base', local_dir='/models/qwen3-tts-1.7b-base', revision='fd4b254389122332181a7c3db7f27e918eec64e3'); \
 print('model at', p)"
 
 COPY engine.py handler.py /app/

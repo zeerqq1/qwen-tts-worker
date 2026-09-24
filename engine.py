@@ -17,12 +17,20 @@ import threading
 import time
 import traceback
 
+# Must be set before torch is imported. The Serverless image sets it in the
+# Dockerfile and the studio sets it for itself; a pod on the stock image had
+# neither, fragmented, hit OOM early and halved its batch for the whole job.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import soundfile as sf
 import torch
 
 MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 MODEL_DIR = os.environ.get("QWEN_MODEL_DIR", "")   # empty -> download by id
+# Exact snapshot to load when downloading by id (pod_boot.sh already pins the
+# local_dir download to it; this covers the fallback path).
+MODEL_REVISION = os.environ.get("QWEN_MODEL_REVISION", "")
 # Off by default: CUDA graphs are incompatible with how this model carries
 # hidden state between decoding steps, and plain inductor compilation is worth
 # far less than a worker that simply never fails.
@@ -99,6 +107,8 @@ def load_model():
         src = MODEL_DIR or MODEL_ID
         t0 = time.time()
         kwargs = dict(device_map="cuda:0", dtype=torch.bfloat16)
+        if not MODEL_DIR and MODEL_REVISION:
+            kwargs["revision"] = MODEL_REVISION
         model = None
         for impl in ("flash_attention_2", "sdpa"):
             try:

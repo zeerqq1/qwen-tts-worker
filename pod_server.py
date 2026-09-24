@@ -16,9 +16,11 @@ whose process exits stops billing, so an abandoned pod cannot quietly run up a
 bill even if the studio crashed, lost its network, or was killed outright.
 """
 
+import json
 import os
 import threading
 import time
+import urllib.request
 
 from flask import Flask, request, jsonify, Response
 
@@ -45,6 +47,40 @@ LOAD_TIMEOUT_SEC = float(os.environ.get("POD_LOAD_TIMEOUT_SEC", "1800"))
 # keeps this process's stdout pointed at the same tee, so the file goes on
 # growing with everything printed below.
 BOOT_LOG = os.environ.get("POD_BOOT_LOG", "/workspace/boot.log")
+# One /generate may hold the GPU this long before the pod gives up on itself.
+# The studio stops waiting for an answer after 900 s; a request still running
+# twice that long is wedged, and «busy» must not exempt it from every clock.
+BUSY_MAX_SEC = float(os.environ.get("POD_BUSY_MAX_SEC", "1800"))
+
+
+def _self_terminate(reason: str):
+    """End this pod's billing, not just this process.
+
+    Exiting the process was the whole safety net here — and it is not one:
+    RunPod restarts a pod's container when its command exits, so an abandoned
+    pod looped through boot forever and billed until the studio's next launch
+    swept it. RunPod injects RUNPOD_POD_ID and a pod-scoped RUNPOD_API_KEY into
+    every pod, so the pod can delete itself through the same REST call the
+    studio uses. Falls back to /stop, and only then to exiting.
+    """
+    print(f"[pod] {reason} — снимаю под", flush=True)
+    pod_id = os.environ.get("RUNPOD_POD_ID", "")
+    key = os.environ.get("RUNPOD_API_KEY", "")
+    if pod_id and key:
+        for method, url in (("DELETE", f"https://rest.runpod.io/v1/pods/{pod_id}"),
+                            ("POST", f"https://rest.runpod.io/v1/pods/{pod_id}/stop")):
+            try:
+                req = urllib.request.Request(url, method=method, headers={
+                    "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    print(f"[pod] {method} {url.rsplit('/', 1)[-1]}: {r.status}", flush=True)
+                break
+            except Exception as e:
+                print(f"[pod] {method} не удался: {e}", flush=True)
+    else:
+        print("[pod] RUNPOD_POD_ID/RUNPOD_API_KEY нет в окружении — только выхожу", flush=True)
+    time.sleep(2)
+    os._exit(0)
 
 app = Flask(__name__)
 _started = time.time()
@@ -62,6 +98,7 @@ _loading = True
 # out — so a long job looked exactly like an abandoned pod and could be killed
 # halfway through its own work.
 _busy = 0
+_busy_since = 0.0
 _lock = threading.Lock()
 # The model is not thread-safe: two generations running at once corrupt each
 # other's tensors ("size of tensor a (16) must match ..."). Flask serves
@@ -106,24 +143,34 @@ def _watchdog():
             idle = time.time() - _last_seen
             no_work = time.time() - _last_job
             busy = _busy
+            busy_for = (time.time() - _busy_since) if (_busy and _busy_since) else 0.0
         alive = time.time() - _started
+        # The hard ceilings apply whatever the pod is doing: a generate() that
+        # never returns used to keep the pod alive forever because «busy»
+        # skipped every clock below.
+        if alive > MAX_LIFE_SEC:
+            _self_terminate(f"предельное время жизни {alive:.0f}s")
+        if busy and busy_for > BUSY_MAX_SEC:
+            _self_terminate(f"одна генерация держит GPU {busy_for:.0f}s — завис")
         if busy:
             continue          # working is the opposite of abandoned
         if _loading:
             # The port is not even open yet, so silence here means nothing.
             if alive > LOAD_TIMEOUT_SEC:
-                print(f"[pod] модель не поднялась за {alive:.0f}s — выхожу", flush=True)
-                os._exit(0)
+                _self_terminate(f"модель не поднялась за {alive:.0f}s")
             continue
         if idle > IDLE_EXIT_SEC:
-            print(f"[pod] {idle:.0f}s без запросов — выхожу", flush=True)
-            os._exit(0)
+            _self_terminate(f"{idle:.0f}s без запросов")
         if no_work > NO_WORK_EXIT_SEC:
-            print(f"[pod] {no_work:.0f}s без единой задачи — выхожу", flush=True)
-            os._exit(0)
-        if alive > MAX_LIFE_SEC:
-            print(f"[pod] предельное время жизни {alive:.0f}s — выхожу", flush=True)
-            os._exit(0)
+            _self_terminate(f"{no_work:.0f}s без единой задачи")
+
+
+def _pkg_version(name: str) -> str:
+    try:
+        import importlib.metadata as _m
+        return _m.version(name)
+    except Exception:
+        return ""
 
 
 def _boot_marks() -> dict:
@@ -165,6 +212,11 @@ def health():
         # build costs minutes of download. This makes either visible.
         "torch": engine.torch.__version__,
         "cuda": engine.torch.version.cuda,
+        # The inference code the pod actually runs. The studio pins the same
+        # version; a mismatch here is a pod that would sound different.
+        "qwen_tts": _pkg_version("qwen-tts"),
+        "transformers": _pkg_version("transformers"),
+        "model_revision": os.environ.get("QWEN_MODEL_REVISION", ""),
         "compiled": engine.is_compiled(),
         "uptime_sec": round(time.time() - _started),
         "idle_sec": round(idle),
@@ -195,9 +247,11 @@ def generate():
         return jsonify({"error": "bad token"}), 401
     _touch()
     _touch_job()
-    global _busy
+    global _busy, _busy_since
     with _lock:
         _busy += 1
+        if _busy == 1:
+            _busy_since = time.time()
     try:
         with _gpu_lock:
             _touch()  # waiting for the lock still counts as being talked to
@@ -205,6 +259,8 @@ def generate():
     finally:
         with _lock:
             _busy -= 1
+            if _busy == 0:
+                _busy_since = 0.0
     _touch()      # generation can take minutes; do not let the watchdog fire
     if out.get("error"):
         return jsonify(out), 500
@@ -218,7 +274,10 @@ def shutdown():
     if not _authorised():
         return jsonify({"error": "bad token"}), 401
     print("[pod] выключение по команде студии", flush=True)
-    threading.Timer(0.5, lambda: os._exit(0)).start()
+    # The studio deletes the pod through its own API call right after this;
+    # deleting ourselves as well is harmless (404 on a pod already gone) and
+    # covers the case where the studio's call never arrives.
+    threading.Timer(0.5, lambda: _self_terminate("команда студии")).start()
     return jsonify({"ok": True})
 
 

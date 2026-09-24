@@ -1,9 +1,10 @@
 # Serverless worker dependencies. Same note about torch as requirements-pod.txt:
 # it comes from the base image and must not be re-resolved by pip.
+# qwen-tts/accelerate pinned to the studio's versions for identical audio.
 runpod>=1.7.0
-qwen-tts
+qwen-tts==0.1.1
 transformers==4.57.3
-accelerate
+accelerate==1.12.0
 soundfile
 numpy
 huggingface_hub

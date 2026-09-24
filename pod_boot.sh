@@ -61,6 +61,31 @@ MARKS=/workspace/boot_times.txt
 mark() { mkdir -p /workspace; echo "$1 $(date +%s)" >> "$MARKS"; }
 mark script_start
 
+# Hard deadline for the whole boot. A boot wedged on its image pull, pip or
+# weights used to run forever if the studio was gone — exiting does not help,
+# RunPod restarts the container — so the pod deletes itself through the API
+# (RunPod injects RUNPOD_POD_ID and a pod-scoped RUNPOD_API_KEY). Cancelled
+# just before the real server takes over; pod_server has its own clocks.
+self_terminate() {
+    python - "$1" <<'PY'
+import os, sys, time, urllib.request
+pod, key = os.environ.get("RUNPOD_POD_ID", ""), os.environ.get("RUNPOD_API_KEY", "")
+print("[boot] " + sys.argv[1] + " — снимаю под", file=sys.stderr, flush=True)
+if pod and key:
+    for method, url in (("DELETE", f"https://rest.runpod.io/v1/pods/{pod}"),
+                        ("POST", f"https://rest.runpod.io/v1/pods/{pod}/stop")):
+        try:
+            req = urllib.request.Request(url, method=method, headers={"Authorization": "Bearer " + key})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                print("[boot] " + method + " -> " + str(r.status), file=sys.stderr, flush=True)
+            break
+        except Exception as e:
+            print("[boot] " + method + " не удался: " + str(e), file=sys.stderr, flush=True)
+PY
+}
+( sleep "${POD_LOAD_TIMEOUT_SEC:-1800}"; self_terminate "загрузка не уложилась в ${POD_LOAD_TIMEOUT_SEC:-1800} с"; ) &
+DEADLINE_PID=$!
+
 # Retry the things that touch the network. A single transient failure used to
 # cost the whole pod; three tries cost seconds.
 retry() {
@@ -111,9 +136,12 @@ log "тяну веса $MODEL_ID -> $MODEL_DIR (фоном)"
 (
     for attempt in 1 2 3; do
         python - "$MODEL_ID" "$MODEL_DIR" <<'PY' && exit 0
-import sys
+import os, sys
 from huggingface_hub import snapshot_download
-snapshot_download(sys.argv[1], local_dir=sys.argv[2], max_workers=8)
+# The studio sends the exact snapshot it runs locally; without it a new push
+# to the repo would change the pods' voice while the local cache kept the old.
+rev = os.environ.get("QWEN_MODEL_REVISION") or None
+snapshot_download(sys.argv[1], local_dir=sys.argv[2], max_workers=8, revision=rev)
 PY
         echo "[boot] веса: попытка $attempt не удалась" >&2
         sleep 5
@@ -132,9 +160,10 @@ retry $PIP --extra-index-url https://download.pytorch.org/whl/cu128 \
     -r requirements-pod.txt || { kill $MODEL_PID 2>/dev/null; exit 1; }
 
 python - <<'PY' || exit 1
-import torch
+import torch, importlib.metadata as m
 assert torch.version.cuda, "torch потерял CUDA — под работал бы на процессоре"
-print("[boot] torch", torch.__version__, "cuda", torch.version.cuda)
+print("[boot] torch", torch.__version__, "cuda", torch.version.cuda,
+      "qwen-tts", m.version("qwen-tts"), "transformers", m.version("transformers"))
 PY
 
 # soundfile normally carries libsndfile inside its wheel; apt is only touched
@@ -158,6 +187,7 @@ log "всё на месте, поднимаю сервер"
 # a port still held by the placeholder would keep this pod "not ready"
 # forever while billing.
 kill "$HEARTBEAT_PID" 2>/dev/null; wait "$HEARTBEAT_PID" 2>/dev/null
+kill "$DEADLINE_PID" 2>/dev/null; wait "$DEADLINE_PID" 2>/dev/null
 kill "$STATUS_PID" 2>/dev/null; wait "$STATUS_PID" 2>/dev/null
 for i in 1 2 3 4 5; do
     # connect_ex is 0 when something still answers on the port. Exit 0 then

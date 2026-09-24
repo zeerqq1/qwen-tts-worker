@@ -1,10 +1,15 @@
 # Pod dependencies. torch/torchaudio come from the base image and are NOT
 # listed: if pip re-resolves torch it can install a CPU build over the CUDA
 # one, and the pod then runs many times slower with no error to notice.
+#
+# qwen-tts and accelerate are pinned to the versions the studio runs locally.
+# Unpinned, the next qwen-tts release would change the pods' inference code
+# (defaults, reference handling) while the local engine stayed the same —
+# and nothing in boot.log or /health would say so.
 flask>=3.0
-qwen-tts
+qwen-tts==0.1.1
 transformers==4.57.3
-accelerate
+accelerate==1.12.0
 soundfile
 numpy
 huggingface_hub
