@@ -8,6 +8,13 @@
 # API if the boot never finishes — exiting would only make RunPod restart the
 # container and keep billing.
 #
+# Why this image and not lmsysorg/sglang-omni:dev: that one is 17GB, and on
+# community hosts three machines in a row spent twenty minutes pulling it and
+# never finished. The stack is on PyPI with exact pins (sglang-omni 0.1.6 ->
+# torch 2.13.0, sglang 0.5.19, flashinfer cu13), and PyTorch publishes a 3GB
+# image with precisely that torch. So: small pull, deterministic pip, weights
+# from Hugging Face, nothing to discover inside somebody else's container.
+#
 # Layout on the pod:
 #   :8001  sgl-omni serve  (SGLang-Omni, the model)
 #   :8000  higgs_server.py (the studio's contract: /health /boot.log /generate)
@@ -15,14 +22,21 @@ set -uo pipefail
 
 mkdir -p /workspace
 exec > >(tee -a /workspace/boot.log) 2>&1
-PY=$(command -v python3 || command -v python)
+# The PyTorch images keep their interpreter in conda; fall back to whatever is
+# on PATH. Chosen once, used for everything: pip, the server, the wrapper.
+PY=""
+for cand in /opt/conda/bin/python /usr/local/bin/python3 /usr/bin/python3; do
+    [ -x "$cand" ] && { PY="$cand"; break; }
+done
+[ -n "$PY" ] || PY=$(command -v python3 || command -v python)
 "$PY" -m http.server "${POD_PORT:-8000}" --bind 0.0.0.0 --directory /workspace >/dev/null 2>&1 &
 STATUS_PID=$!
-echo "[boot] $(date -u +%H:%M:%S) старт · $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || echo 'nvidia-smi недоступен') · воркер ${POD_WORKER_REVISION:-main}"
+echo "[boot] $(date -u +%H:%M:%S) старт · $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || echo 'nvidia-smi недоступен') · воркер ${POD_WORKER_REVISION:-main} · python $("$PY" -c 'import sys; print(sys.version.split()[0])')"
 
 REPO_TAR="${POD_REPO_TAR:-https://codeload.github.com/zeerqq1/qwen-tts-worker/tar.gz/refs/heads/main}"
 DIR=/workspace/worker
 MODEL_ID="${HIGGS_MODEL_ID:-bosonai/higgs-tts-3-4b}"
+SGL_OMNI_VERSION="${HIGGS_SGL_OMNI_VERSION:-0.1.6}"
 UP_PORT="${HIGGS_UPSTREAM_PORT:-8001}"
 REFS_DIR="${HIGGS_REFS_DIR:-/workspace/refs}"
 PIP="$PY -m pip install -q --no-cache-dir --break-system-packages"
@@ -33,8 +47,8 @@ MARKS=/workspace/boot_times.txt
 mark() { mkdir -p /workspace; echo "$1 $(date +%s)" >> "$MARKS"; }
 mark script_start
 
-# The two long steps (image pull, weights) print nothing while they run, and a
-# quiet pod is a pod the studio writes off. Heartbeat until the hand-over.
+# The long steps print nothing while they run, and a quiet pod is a pod the
+# studio writes off. Heartbeat until the hand-over.
 ( while :; do sleep 20; echo "[boot] ...идёт загрузка"; done ) &
 HEARTBEAT_PID=$!
 
@@ -57,12 +71,16 @@ PY
 }
 ( sleep "${POD_LOAD_TIMEOUT_SEC:-1800}"; self_terminate "загрузка не уложилась в ${POD_LOAD_TIMEOUT_SEC:-1800} с"; ) &
 DEADLINE_PID=$!
+# A boot that fails for good must not merely exit: RunPod would restart the
+# container into the same failure and bill for every lap. Say why, end the pod.
+MODEL_PID=0
+die() { log "ПРОВАЛ: $*"; kill "$MODEL_PID" 2>/dev/null; self_terminate "$*"; exit 1; }
 
 retry() {
     local n=0
     until "$@"; do
         n=$((n + 1))
-        if [ "$n" -ge 3 ]; then log "ПРОВАЛ после 3 попыток: $*"; return 1; fi
+        if [ "$n" -ge 3 ]; then log "не вышло после 3 попыток: $*"; return 1; fi
         log "попытка $n не удалась, повтор: $*"
         sleep 3
     done
@@ -87,64 +105,16 @@ shutil.rmtree(tmp, ignore_errors=True)
 print("[boot] код: " + ", ".join(sorted(os.listdir(dest))[:8]), file=sys.stderr)
 PY
 }
-retry fetch_code || exit 1
+retry fetch_code || die "код воркера не скачался"
 mark code_done
-cd "$DIR" || exit 1
+cd "$DIR" || die "нет папки воркера"
 mkdir -p "$REFS_DIR"
 
-# ── 1b. The interpreter that actually has the model stack in it. ──
-#
-# This image ships its environment in a virtualenv, not in /usr/bin/python3,
-# and the difference is not cosmetic: the system interpreter has no sglang, so
-# installing the server there tries to resolve torch, flash-attn and the rest
-# from scratch and ends in ResolutionImpossible. Pick the interpreter that
-# already imports sglang; everything after this point uses it.
-log "кандидаты: $(ls -d /sgl-workspace/*/.venv/bin/python /sgl-workspace/.venv/bin/python /opt/*/.venv/bin/python /opt/venv/bin/python /usr/local/bin/python3 /usr/bin/python3 2>/dev/null | tr '\n' ' ')"
-for cand in $(ls -d /sgl-workspace/*/.venv/bin/python /sgl-workspace/.venv/bin/python \
-                   /opt/*/.venv/bin/python /opt/venv/bin/python /root/.venv/bin/python \
-                   /workspace/.venv/bin/python /usr/local/bin/python3 /usr/bin/python3 2>/dev/null); do
-    [ -x "$cand" ] || continue
-    if "$cand" -c "import sglang" 2>/dev/null; then
-        PY="$cand"
-        log "рабочее окружение: $PY (sglang $("$PY" -c 'import importlib.metadata as m; print(m.version("sglang"))' 2>/dev/null))"
-        break
-    fi
-done
-PIP="$PY -m pip install -q --no-cache-dir --break-system-packages"
-log "питон для сервера и обёртки: $PY"
-
 # ── 2. Weights, in the background: the single biggest item starts first. ──
-#
-# Install as little as possible. This image is a working SGLang environment with
-# torch, transformers, numpy and huggingface_hub already pinned against each
-# other; a blanket install (and --ignore-installed on top of it) pulled newer
-# numpy and huggingface_hub over them, and eight packages then declared the
-# result incompatible. So: ask Python what is actually missing and install only
-# that. --ignore-installed is a fallback for a package apt owns (flask needs
-# blinker, which pip may refuse to uninstall), never for the numeric stack.
-missing() {
-    local need=""
-    for pair in $1; do
-        pkg="${pair%%:*}"; mod="${pair##*:}"
-        "$PY" -c "import $mod" 2>/dev/null || need="$need $pkg"
-    done
-    echo "$need"
-}
-install_deps() {
-    local need
-    need=$(missing "flask:flask requests:requests soundfile:soundfile numpy:numpy huggingface_hub:huggingface_hub")
-    if [ -z "$need" ]; then log "зависимости обёртки уже в образе"; return 0; fi
-    log "ставлю недостающее:$need"
-    $PIP $need && return 0
-    log "pip споткнулся о системном пакете — повторяю с --ignore-installed для:$need"
-    $PIP --ignore-installed $need
-}
-log "проверяю зависимости обёртки"
-retry install_deps || exit 1
-# Several connections instead of one when pulling 8GB. Nice to have, never fatal.
-"$PY" -c "import hf_transfer" 2>/dev/null || $PIP hf_transfer || log "hf_transfer не встал — качаю одним потоком"
-mark pip_hf_done
+retry $PIP -U huggingface_hub || die "huggingface_hub не встал"
+"$PY" -c "import hf_transfer" 2>/dev/null || $PIP hf_transfer >/dev/null 2>&1 || true
 "$PY" -c "import hf_transfer" 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1
+mark pip_hf_done
 log "тяну веса $MODEL_ID (фоном)"
 (
     for attempt in 1 2 3; do
@@ -161,64 +131,15 @@ PY
 MODEL_PID=$!
 mark download_started
 
-# ── 3. The server itself.
-#
-# Measured on a live pod: lmsysorg/sglang-omni:dev carries the dependencies but
-# NOT the console script — the published recipe installs the repo inside the
-# container. Three ways to find it, cheapest first; the git install is --no-deps
-# because everything it needs is already here, and letting pip re-resolve the
-# dependency set is exactly what broke the first attempt.
-# The only check that means anything: the Higgs plugin itself has to import.
-# The server loads its model backends optionally and prints "Ignore import
-# error when loading sglang_omni.models.higgs_tts: ..." when one of them cannot
-# be loaded — then serves happily with no Higgs in it.
-higgs_ok() { "$PY" -c "import sglang_omni.models.higgs_tts" 2>/dev/null; }
-set_cmd() {
-    if command -v sgl-omni >/dev/null 2>&1; then SGL_CMD="sgl-omni"
-    elif "$PY" -c "import sglang_omni.cli" 2>/dev/null; then SGL_CMD="$PY -m sglang_omni.cli"
-    else SGL_CMD=""; fi
-}
+# ── 3. The server stack, from PyPI, pinned. torch in this image already matches
+#       sglang-omni's pin, so pip resolves the rest without touching it. ──
+log "torch в образе: $("$PY" -c 'import torch; print(torch.__version__, "cuda", torch.version.cuda)' 2>/dev/null || echo 'нет')"
+log "ставлю sglang-omni==$SGL_OMNI_VERSION и flask"
+retry $PIP "sglang-omni==$SGL_OMNI_VERSION" flask requests soundfile \
+    || die "sglang-omni==$SGL_OMNI_VERSION не установился (см. лог выше)"
 
-SGL_CMD=""
-set_cmd
-if [ -n "$SGL_CMD" ] && higgs_ok; then
-    log "sgl-omni уже в образе и плагин Higgs на месте"
-else
-    # An editable install of whatever source the image already carries beats a
-    # fresh clone: it is the version this image's sglang was built against.
-    SRC=""
-    for d in /sgl-workspace/sglang-omni /opt/sglang-omni /workspace/sglang-omni /root/sglang-omni; do
-        [ -f "$d/pyproject.toml" ] && { SRC="$d"; break; }
-    done
-    if [ -z "$SRC" ]; then
-        log "исходников sglang-omni в образе нет — клонирую"
-        retry git clone --depth 1 https://github.com/sgl-project/sglang-omni /opt/sglang-omni || {
-            log "ПРОВАЛ: не удалось склонировать sglang-omni"; kill $MODEL_PID 2>/dev/null; exit 1; }
-        SRC=/opt/sglang-omni
-    fi
-    log "ставлю sglang-omni из $SRC в $PY"
-    # --no-deps first: in an environment that already has the stack, this is
-    # all that is needed and it cannot disturb the pins. Only if the plugin
-    # still will not import do we let pip resolve dependencies.
-    $PIP --no-deps -e "$SRC" || log "установка без зависимостей не прошла"
-    set_cmd
-    if [ -z "$SGL_CMD" ] || ! higgs_ok; then
-        log "плагин не поднялся — ставлю с зависимостями"
-        retry $PIP -e "$SRC" || { log "ПРОВАЛ: не удалось поставить sglang-omni"; kill $MODEL_PID 2>/dev/null; exit 1; }
-    fi
-    set_cmd
-    if [ -z "$SGL_CMD" ] || ! higgs_ok; then
-        log "плагин Higgs не импортируется после установки — подробности:"
-        "$PY" -c "import sglang_omni.models.higgs_tts" 2>&1 | tail -5
-        kill $MODEL_PID 2>/dev/null; exit 1
-    fi
-fi
-# ── 3b. Whatever the server still asks for, by name. ──
-#
-# This image is nearly complete and missing the odd package (msgpack, on the
-# pod that taught this). The server names the module in its ModuleNotFoundError,
-# so install that one module and ask again. Bounded, and never a resolving
-# install: re-resolving the dependency set is what broke the first pods.
+# Whatever the server still asks for, by name: the module comes out of the
+# ModuleNotFoundError, one package at a time, never a resolving reinstall.
 pip_name() {
     case "$1" in
         zmq) echo pyzmq ;; PIL) echo pillow ;; cv2) echo opencv-python-headless ;;
@@ -226,32 +147,25 @@ pip_name() {
         google) echo protobuf ;; *) echo "$1" ;;
     esac
 }
-probe_imports() {
-    # Both the plugin and the entry point the pod actually runs.
-    "$PY" -c "import sglang_omni.models.higgs_tts, sglang_omni.cli" 2>&1
-}
+probe_imports() { "$PY" -c "import sglang_omni.models.higgs_tts, sglang_omni.cli" 2>&1; }
 for _ in 1 2 3 4 5 6 7 8; do
     out=$(probe_imports) || true
     miss=$(printf '%s\n' "$out" | sed -n "s/.*No module named '\([^']*\)'.*/\1/p" | head -1)
     [ -z "$miss" ] && break
     pkg=$(pip_name "${miss%%.*}")
-    log "серверу не хватает модуля $miss — ставлю пакет $pkg"
-    $PIP "$pkg" || $PIP --ignore-installed "$pkg" || { log "ПРОВАЛ: $pkg не встал"; break; }
+    log "серверу не хватает модуля $miss — ставлю $pkg"
+    $PIP "$pkg" || $PIP --ignore-installed "$pkg" || break
 done
 if ! "$PY" -c "import sglang_omni.models.higgs_tts, sglang_omni.cli" 2>/dev/null; then
-    log "ПРОВАЛ: сервер всё ещё не импортируется:"
-    probe_imports | tail -6
-    kill $MODEL_PID 2>/dev/null; exit 1
+    log "плагин Higgs не импортируется:"; probe_imports | tail -8
+    die "sglang_omni не импортируется"
 fi
-
-log "sgl-omni: $SGL_CMD · sglang $($PY -c 'import importlib.metadata as m; print(m.version(\"sglang\"))' 2>/dev/null || echo '?')"
+SGL_CMD="sgl-omni"; command -v sgl-omni >/dev/null 2>&1 || SGL_CMD="$PY -m sglang_omni.cli"
+log "сервер: $SGL_CMD · sglang $("$PY" -c 'import importlib.metadata as m; print(m.version("sglang"))' 2>/dev/null || echo '?') · torch $("$PY" -c 'import torch; print(torch.__version__)' 2>/dev/null)"
 mark pip_done
 
 log "жду веса"
-if ! wait $MODEL_PID; then
-    log "ПРОВАЛ: веса не скачались"
-    exit 1
-fi
+wait $MODEL_PID || die "веса не скачались"
 mark weights_done
 
 # ── 4. The model on the private port, the wrapper on the public one. ──
@@ -259,17 +173,13 @@ log "поднимаю SGLang-Omni на :$UP_PORT"
 $SGL_CMD serve --model-path "$MODEL_ID" --host 127.0.0.1 --port "$UP_PORT" \
     --allowed-local-media-path "$REFS_DIR" &
 SGL_PID=$!
-
 SGL_TRIES=0
 for i in $(seq 1 240); do
-    if "$PY" -c "import sys,urllib.request; urllib.request.urlopen('http://127.0.0.1:${UP_PORT}/v1/models', timeout=5)" 2>/dev/null; then
+    if "$PY" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${UP_PORT}/v1/models', timeout=5)" 2>/dev/null; then
         log "SGLang отвечает"
         break
     fi
     if ! kill -0 "$SGL_PID" 2>/dev/null; then
-        # It named what it was missing on the way out; install that and retry
-        # once, rather than throw away a pod that has already paid for its
-        # image and its weights.
         miss=$(tail -80 /workspace/boot.log | sed -n "s/.*No module named '\([^']*\)'.*/\1/p" | tail -1)
         SGL_TRIES=$((SGL_TRIES + 1))
         if [ -n "$miss" ] && [ "$SGL_TRIES" -le 3 ]; then
@@ -281,11 +191,12 @@ for i in $(seq 1 240); do
             SGL_PID=$!
             continue
         fi
-        log "ПРОВАЛ: sgl-omni завершился на старте"
-        exit 1
+        die "sgl-omni завершился на старте"
     fi
     sleep 5
 done
+"$PY" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${UP_PORT}/v1/models', timeout=5)" 2>/dev/null \
+    || die "SGLang не ответил за 20 минут"
 mark model_ready
 
 # Hand the public port over: the placeholder must let go before the wrapper binds.
